@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-generated artifacts
+*.pdf
+output_cards/
+output.json
+*.png
+*.jpg
+*.jpeg
+*.webp
