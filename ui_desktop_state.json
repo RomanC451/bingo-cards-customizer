@@ -1,0 +1,20 @@
+{
+  "template_path": "D:\\bingo-cards\\Carton-v2-5x5.png",
+  "pdf_path": "D:\\bingo-cards\\5x5.pdf",
+  "output_dir": "D:\\bingo-cards\\output_cards",
+  "text_color": "#000000",
+  "font_size": 24,
+  "text_offset_x": 0,
+  "text_offset_y": 16,
+  "free_icon_size": 0.85,
+  "free_icon_path": null,
+  "grid_offset_x": 0,
+  "grid_offset_y": 0,
+  "manual_cell_width": 0,
+  "manual_cell_height": 0,
+  "show_grid_overlay": true,
+  "music_name_overrides": {},
+  "text_settings_expanded": true,
+  "grid_settings_expanded": true,
+  "tutorial_seen": true
+}
