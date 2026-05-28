@@ -1,0 +1,5 @@
+pdfplumber
+Pillow
+customtkinter
+skia-python
+numpy

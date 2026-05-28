@@ -7,10 +7,10 @@ from pathlib import Path
 
 from PIL import Image
 
-ICONS_DIR = Path(__file__).resolve().parent / "icons"
-TOOLBAR_ICON_COLOR = (229, 231, 235)  # light gray for dark UI
-TOOLBAR_ICON_DISABLED_COLOR = (107, 114, 128)  # muted gray when unavailable
-# First existing file wins (PNG preferred).
+from bingo_cards.config import ICONS_DIR
+
+TOOLBAR_ICON_COLOR = (229, 231, 235)
+TOOLBAR_ICON_DISABLED_COLOR = (107, 114, 128)
 ICON_CANDIDATES: dict[str, list[str]] = {
     "undo": ["undo-2.png", "undo.png", "undo.svg"],
     "redo": ["redo-2.png", "redo.png", "redo.svg"],
@@ -30,7 +30,6 @@ def _resolve_icon_path(kind: str) -> Path:
 
 
 def _tint_icon(image: Image.Image, color: tuple[int, int, int] = TOOLBAR_ICON_COLOR) -> Image.Image:
-    """Lucide PNG exports use black strokes; recolor for dark toolbar buttons."""
     _red, _green, _blue, alpha = image.convert("RGBA").split()
     return Image.merge(
         "RGBA",

@@ -107,7 +107,6 @@ def generate_playlist_pdf(
         try:
             old_pdf.unlink()
         except OSError:
-            # Ignore locked files; we only need best-effort cleanup.
             pass
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     file_stem = _safe_stem(f"spotify_{options.grid_size}x{options.grid_size}_{timestamp}")

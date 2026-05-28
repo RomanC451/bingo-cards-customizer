@@ -1,0 +1,14 @@
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+ICONS_DIR = PROJECT_ROOT / "icons"
+FREE_IMAGE_PATH = ICONS_DIR / "freee.png"
+APP_STATE_PATH = PROJECT_ROOT / "ui_desktop_state.json"
+SPOTIFY_TEMP_PDF_DIR = PROJECT_ROOT / "tmp" / "spotify_import"
+OUTPUT_JSON_PATH = PROJECT_ROOT / "output.json"
+
+SUPPORTED_GRID_SIZES = (3, 4, 5, 6)
+FREE_ICON_SIZE_DEFAULT = 0.85
+CUSTOMIZE_UNDO_LIMIT = 50
+PREVIEW_REFRESH_DEBOUNCE_MS = 60
+SAVE_STATE_DEBOUNCE_MS = 500

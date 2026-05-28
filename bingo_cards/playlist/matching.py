@@ -2,18 +2,9 @@ from __future__ import annotations
 
 from difflib import SequenceMatcher
 
+from bingo_cards.text_normalize import normalize_cell_text
+
 MATCH_MIN_RATIO = 0.52
-
-
-def normalize_cell_text(text: str) -> str:
-    cleaned = " ".join((text or "").split())
-    cleaned = (
-        cleaned.replace(" ,", ",")
-        .replace(" .", ".")
-        .replace(" ;", ";")
-        .replace(" :", ":")
-    )
-    return cleaned.strip()
 
 
 def format_playlist_track_label(track: dict, include_artist: bool) -> str:

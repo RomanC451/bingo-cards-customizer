@@ -1,6 +1,0 @@
-pdfplumber
-Pillow
-opencv-python
-streamlit
-customtkinter
-skia-python

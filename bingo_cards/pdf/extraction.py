@@ -1,15 +1,14 @@
-import json
 import re
-import sys
 from collections import defaultdict
 from pathlib import Path
 
 import pdfplumber
 
+from bingo_cards.config import SUPPORTED_GRID_SIZES
+from bingo_cards.text_normalize import normalize_cell_text
+
 STOP_MARKER = "BINGO MASTER CHEAT SHEET"
 CARD_NUMBER_PATTERN = re.compile(r"Card\s*#\s*(\d+)", re.IGNORECASE)
-SUPPORTED_GRID_SIZES = (3, 4, 5, 6)
-OUTPUT_JSON_PATH = Path("output.json")
 
 
 def kmeans_1d(values: list[float], k: int, iterations: int = 30) -> list[float]:
@@ -45,6 +44,10 @@ def nearest_center_distance(value: float, centers: list[float]) -> float:
     if not centers:
         return 0.0
     return min(abs(value - center) for center in centers)
+
+
+def closest_center_index(value: float, centers: list[float]) -> int:
+    return min(range(len(centers)), key=lambda idx: abs(value - centers[idx]))
 
 
 def infer_grid_size_from_layout(page) -> int | None:
@@ -125,18 +128,6 @@ def infer_grid_size(
             best_size = size
 
     return best_size
-
-
-def normalize_cell_text(text: str) -> str:
-    cleaned = " ".join(text.split())
-    cleaned = (
-        cleaned.replace(" ,", ",")
-        .replace(" .", ".")
-        .replace(" ;", ";")
-        .replace(" :", ":")
-    )
-    cleaned = cleaned.replace(" - ", " - ")
-    return cleaned.strip()
 
 
 def extract_card_from_page(page, forced_grid_size: int | None = None) -> dict | None:
@@ -245,13 +236,3 @@ def pick_input_pdf(cli_path: str | None = None) -> Path:
         raise FileNotFoundError("No PDF files found in current directory.")
 
     return pdf_files[0]
-
-
-if __name__ == "__main__":
-    pdf_file = pick_input_pdf(sys.argv[1] if len(sys.argv) > 1 else None)
-    result = extract_bingo_cards(pdf_file)
-    OUTPUT_JSON_PATH.write_text(
-        json.dumps(result, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    print(f"Saved {len(result)} cards to {OUTPUT_JSON_PATH}")

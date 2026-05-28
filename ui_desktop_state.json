@@ -1,85 +1,25 @@
 {
-  "template_path": "D:\\bingo-cards\\Carton-v1-5x5.png",
-  "pdf_path": "tmp\\spotify_import\\spotify_5x5_20260528_182433.pdf",
+  "template_path": "D:\\bingo-cards\\templates\\Carton-v1-5x5-new.png",
+  "pdf_path": "D:\\bingo-cards\\tmp\\spotify_import\\spotify_5x5_20260528_190338.pdf",
   "output_dir": "D:\\bingo-cards\\output_cards",
   "text_color": "#000000",
   "font_size": 17,
   "text_offset_x": 0,
-  "text_offset_y": 19,
+  "text_offset_y": 23,
   "free_icon_size": 0.7,
   "free_icon_path": null,
   "pdf_layout": 5,
-  "grid_x": 79,
-  "grid_y": 519,
-  "grid_cell_width": 179,
-  "grid_cell_height": 189,
+  "grid_x": 52,
+  "grid_y": 515,
+  "grid_cell_width": 190,
+  "grid_cell_height": 185,
   "show_grid_overlay": true,
   "music_name_overrides": {},
   "playlist_tracks": [
     {
       "id": null,
-      "name": "DEUCESS",
-      "artist": "Berechet,\u00a0VANILLA"
-    },
-    {
-      "id": null,
-      "name": "A\u0219a \u0219i a\u0219a",
-      "artist": "Babasha,\u00a0Denis Ramniceanu"
-    },
-    {
-      "id": null,
-      "name": "Choke Me",
-      "artist": "Alexandra C\u0103pit\u0103nescu"
-    },
-    {
-      "id": null,
-      "name": "TRECI PESTE",
-      "artist": "VANILLA"
-    },
-    {
-      "id": null,
-      "name": "Nebunatica",
-      "artist": "MADATORRICELLI,\u00a0LiToo The Purp"
-    },
-    {
-      "id": null,
-      "name": "Te juri ca vrei",
-      "artist": "Mariano"
-    },
-    {
-      "id": null,
-      "name": "M\u0103 sun\u0103 nebunele",
-      "artist": "Lazy Ed"
-    },
-    {
-      "id": null,
-      "name": "NA BELEA",
-      "artist": "MADATORRICELLI"
-    },
-    {
-      "id": null,
-      "name": "Papaya",
-      "artist": "Babasha"
-    },
-    {
-      "id": null,
-      "name": "Jamaica - Live",
-      "artist": "Luis Gabriel"
-    },
-    {
-      "id": null,
-      "name": "SWIM",
-      "artist": "BTS"
-    },
-    {
-      "id": null,
-      "name": "Mor dup\u0103 tine",
-      "artist": "Lazy Ed,\u00a0JO"
-    },
-    {
-      "id": null,
-      "name": "Taj Mahal",
-      "artist": "rares,\u00a0Lazy Ed,\u00a0Costel Biju"
+      "name": "Beauty And A Beat",
+      "artist": "Justin Bieber,\u00a0Nicki Minaj"
     },
     {
       "id": null,
@@ -88,133 +28,13 @@
     },
     {
       "id": null,
-      "name": "Gagicuta body show",
-      "artist": "Tzanca Uraganu"
+      "name": "the cure",
+      "artist": "Olivia Rodrigo"
     },
     {
       "id": null,
-      "name": "Cupidoane",
-      "artist": "Tzanca Uraganu"
-    },
-    {
-      "id": null,
-      "name": "STIU CA TI-E DOR",
-      "artist": "Berechet,\u00a0VANILLA,\u00a021SIIEMPRE,\u00a0CERCEL"
-    },
-    {
-      "id": null,
-      "name": "Regele pe reggaeton",
-      "artist": "rares,\u00a0Ursaru"
-    },
-    {
-      "id": null,
-      "name": "Peter Parker - Balkanic Version",
-      "artist": "Lele,\u00a0Petre Stefan,\u00a0Manele VTM"
-    },
-    {
-      "id": null,
-      "name": "Trag \u00een ea",
-      "artist": "MADATORRICELLI"
-    },
-    {
-      "id": null,
-      "name": "PRIETENA TA",
-      "artist": "DZWS,\u00a0VANILLA,\u00a0Dj Nattan"
-    },
-    {
-      "id": null,
-      "name": "Talentul meu misto",
-      "artist": "Luis Gabriel"
-    },
-    {
-      "id": null,
-      "name": "Izabela",
-      "artist": "Connect-R"
-    },
-    {
-      "id": null,
-      "name": "Bangaranga",
-      "artist": "DARA"
-    },
-    {
-      "id": null,
-      "name": "Beat It",
-      "artist": "Michael Jackson"
-    },
-    {
-      "id": null,
-      "name": "CAND VINE NOAPTEA",
-      "artist": "VANILLA"
-    },
-    {
-      "id": null,
-      "name": "Da fata se vede belea",
-      "artist": "Alex Botea,\u00a0Luis Gabriel"
-    },
-    {
-      "id": null,
-      "name": "C\u00e2t vrei tu",
-      "artist": "Babasha"
-    },
-    {
-      "id": null,
-      "name": "Savarina",
-      "artist": "Alex Botea,\u00a0Raul Talent"
-    },
-    {
-      "id": null,
-      "name": "Ran To Atlanta (feat. Future & Molly Santana)",
-      "artist": "Drake,\u00a0Future,\u00a0Molly Santana"
-    },
-    {
-      "id": null,
-      "name": "National Treasures",
-      "artist": "Drake"
-    },
-    {
-      "id": null,
-      "name": "Ramai talent",
-      "artist": "Luis Gabriel"
-    },
-    {
-      "id": null,
-      "name": "Bipolar\u0103",
-      "artist": "Denis Ramniceanu,\u00a0Ministerul Manelelor"
-    },
-    {
-      "id": null,
-      "name": "Dirty Diana - 2012 Remaster",
-      "artist": "Michael Jackson"
-    },
-    {
-      "id": null,
-      "name": "Babydoll",
-      "artist": "Dominic Fike"
-    },
-    {
-      "id": null,
-      "name": "Chicago",
-      "artist": "Michael Jackson"
-    },
-    {
-      "id": null,
-      "name": "PETER PARKER",
-      "artist": "Petre Stefan"
-    },
-    {
-      "id": null,
-      "name": "mr. idcash",
-      "artist": "IDK"
-    },
-    {
-      "id": null,
-      "name": "FATA DIN FAVELA",
-      "artist": "VANILLA,\u00a0Badd G"
-    },
-    {
-      "id": null,
-      "name": "Beauty And A Beat",
-      "artist": "Justin Bieber,\u00a0Nicki Minaj"
+      "name": "SWIM",
+      "artist": "BTS"
     },
     {
       "id": null,
@@ -223,8 +43,143 @@
     },
     {
       "id": null,
-      "name": "Damelo",
-      "artist": "Tzanca Uraganu,\u00a0Mr. Juve"
+      "name": "Babydoll",
+      "artist": "Dominic Fike"
+    },
+    {
+      "id": null,
+      "name": "Beat It",
+      "artist": "Michael Jackson"
+    },
+    {
+      "id": null,
+      "name": "Earrings",
+      "artist": "Malcolm Todd"
+    },
+    {
+      "id": null,
+      "name": "The One That Got Away",
+      "artist": "Katy Perry"
+    },
+    {
+      "id": null,
+      "name": "drop dead",
+      "artist": "Olivia Rodrigo"
+    },
+    {
+      "id": null,
+      "name": "back to friends",
+      "artist": "sombr"
+    },
+    {
+      "id": null,
+      "name": "DtMF",
+      "artist": "Bad Bunny"
+    },
+    {
+      "id": null,
+      "name": "End of Beginning",
+      "artist": "Djo"
+    },
+    {
+      "id": null,
+      "name": "Human Nature",
+      "artist": "Michael Jackson"
+    },
+    {
+      "id": null,
+      "name": "Chicago",
+      "artist": "Michael Jackson"
+    },
+    {
+      "id": null,
+      "name": "Self Aware",
+      "artist": "Temper City"
+    },
+    {
+      "id": null,
+      "name": "Dracula - JENNIE Remix",
+      "artist": "Tame Impala,\u00a0JENNIE"
+    },
+    {
+      "id": null,
+      "name": "Man I Need",
+      "artist": "Olivia Dean"
+    },
+    {
+      "id": null,
+      "name": "Iris",
+      "artist": "The Goo Goo Dolls"
+    },
+    {
+      "id": null,
+      "name": "Don't Stop 'Til You Get Enough",
+      "artist": "Michael Jackson"
+    },
+    {
+      "id": null,
+      "name": "Risk It All",
+      "artist": "Bruno Mars"
+    },
+    {
+      "id": null,
+      "name": "National Treasures",
+      "artist": "Drake"
+    },
+    {
+      "id": null,
+      "name": "Raindance (feat. Tems)",
+      "artist": "Dave,\u00a0Tems"
+    },
+    {
+      "id": null,
+      "name": "On The Floor",
+      "artist": "Jennifer Lopez,\u00a0Pitbull"
+    },
+    {
+      "id": null,
+      "name": "Choosin' Texas",
+      "artist": "Ella Langley"
+    },
+    {
+      "id": null,
+      "name": "The Fate of Ophelia",
+      "artist": "Taylor Swift"
+    },
+    {
+      "id": null,
+      "name": "Stateside + Zara Larsson",
+      "artist": "PinkPantheress,\u00a0Zara Larsson"
+    },
+    {
+      "id": null,
+      "name": "Love Me Not",
+      "artist": "Ravyn Lenae"
+    },
+    {
+      "id": null,
+      "name": "Lush Life",
+      "artist": "Zara Larsson"
+    },
+    {
+      "id": null,
+      "name": "Ordinary",
+      "artist": "Alex Warren"
+    },
+    {
+      "id": null,
+      "name": "BAILE INoLVIDABLE",
+      "artist": "Bad Bunny"
+    },
+    {
+      "id": null,
+      "name": "Shabang",
+      "artist": "Drake"
+    },
+    {
+      "id": null,
+      "name": "So Easy (To Fall In Love)",
+      "artist": "Olivia Dean"
     },
     {
       "id": null,
@@ -233,47 +188,92 @@
     },
     {
       "id": null,
-      "name": "Walla Eh",
-      "artist": "Babasha"
+      "name": "Die With A Smile",
+      "artist": "Lady Gaga,\u00a0Bruno Mars"
     },
     {
       "id": null,
-      "name": "Hai la mine in BMWU",
-      "artist": "Denis Ramniceanu,\u00a0Ministerul Manelelor"
+      "name": "Sweater Weather",
+      "artist": "The Neighbourhood"
     },
     {
       "id": null,
-      "name": "E Mult, E Greu!",
-      "artist": "Johny Romano"
+      "name": "DAISIES",
+      "artist": "Justin Bieber"
     },
     {
       "id": null,
-      "name": "Jamaican (Bam Bam)",
-      "artist": "HUGEL,\u00a0SOLTO (FR)"
+      "name": "White Keys",
+      "artist": "Dominic Fike"
     },
     {
       "id": null,
-      "name": "Nu m\u0103 las\u0103 \u00een pace",
-      "artist": "Ursaru,\u00a0Badd G"
+      "name": "NUEVAYoL",
+      "artist": "Bad Bunny"
     },
     {
       "id": null,
-      "name": "Baklava",
-      "artist": "Gya,\u00a0Babasha"
+      "name": "Ran To Atlanta (feat. Future & Molly Santana)",
+      "artist": "Drake,\u00a0Future,\u00a0Molly Santana"
     },
     {
       "id": null,
-      "name": "CATEL",
-      "artist": "MADATORRICELLI"
+      "name": "Mr. Brightside",
+      "artist": "The Killers"
+    },
+    {
+      "id": null,
+      "name": "WHERE IS MY HUSBAND!",
+      "artist": "RAYE"
+    },
+    {
+      "id": null,
+      "name": "One Dance",
+      "artist": "Drake,\u00a0Wizkid,\u00a0Kyla"
+    },
+    {
+      "id": null,
+      "name": "Golden",
+      "artist": "HUNTR/X,\u00a0EJAE,\u00a0AUDREY NUNA,\u00a0REI AMI,\u00a0KPop Demon Hunters Cast"
+    },
+    {
+      "id": null,
+      "name": "Sailor Song",
+      "artist": "Gigi Perez"
+    },
+    {
+      "id": null,
+      "name": "Riptide",
+      "artist": "Vance Joy"
+    },
+    {
+      "id": null,
+      "name": "Smooth Criminal - 2012 Remaster",
+      "artist": "Michael Jackson"
+    },
+    {
+      "id": null,
+      "name": "BIRDS OF A FEATHER",
+      "artist": "Billie Eilish"
+    },
+    {
+      "id": null,
+      "name": "Creep",
+      "artist": "Radiohead"
+    },
+    {
+      "id": null,
+      "name": "Every Breath You Take",
+      "artist": "The Police"
     }
   ],
   "playlist_include_artist": true,
-  "spotify_playlist_url": "https://open.spotify.com/playlist/37i9dQZEVXbMeCoUmQDLUW",
+  "spotify_playlist_url": "https://open.spotify.com/playlist/37i9dQZEVXbMDoHDwVN2tF",
   "spotify_grid_size": "5x5",
-  "spotify_card_count": 10,
+  "spotify_card_count": 30,
   "spotify_include_artist": true,
   "spotify_free_center": true,
-  "text_settings_expanded": false,
+  "text_settings_expanded": true,
   "grid_settings_expanded": true,
   "tutorial_seen": true
 }
