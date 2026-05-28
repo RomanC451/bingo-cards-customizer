@@ -1,25 +1,46 @@
 from pathlib import Path
 import os
 import json
+import re
 import ctypes
+import threading
+from urllib.parse import urlparse
 from ctypes import wintypes
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox
 
 import customtkinter as ctk
-import cv2
 import numpy as np
 import pdfplumber
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
-from main import extract_bingo_cards, infer_grid_size, infer_grid_size_from_layout
-from recreate_cards import detect_grid_cells_fallback
+from main import (
+    extract_bingo_cards,
+    infer_grid_size,
+    infer_grid_size_from_layout,
+    normalize_cell_text,
+)
+from playlist_pdf_generator import (
+    PlaylistGenerationError,
+    PlaylistGenerationOptions,
+    PlaylistPdfResult,
+    generate_playlist_pdf,
+)
+from playlist_track_matching import (
+    match_cell_to_playlist_label,
+    playlist_track_labels,
+)
+from toolbar_icons import load_toolbar_icon
 
 
 SUPPORTED_GRID_SIZES = (3, 4, 5, 6)
 FREE_IMAGE_PATH = Path("freee.png")
 FREE_ICON_SIZE_DEFAULT = 0.85
+CUSTOMIZE_UNDO_LIMIT = 50
+PREVIEW_REFRESH_DEBOUNCE_MS = 60
+SAVE_STATE_DEBOUNCE_MS = 500
 APP_STATE_PATH = Path("ui_desktop_state.json")
+SPOTIFY_TEMP_PDF_DIR = Path("tmp") / "spotify_import"
 
 
 def get_windows_work_area() -> tuple[int, int, int, int] | None:
@@ -35,6 +56,183 @@ def get_windows_work_area() -> tuple[int, int, int, int] | None:
     return rect.left, rect.top, rect.right, rect.bottom
 
 
+class HoverToolTip:
+    def __init__(self, widget, text: str, delay_ms: int = 400):
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self._tip_window: tk.Toplevel | None = None
+        self._after_id: str | None = None
+        widget.bind("<Enter>", self._on_enter, add="+")
+        widget.bind("<Leave>", self._on_leave, add="+")
+        widget.bind("<ButtonPress>", self._on_leave, add="+")
+
+    def _on_enter(self, _event=None):
+        self._cancel_schedule()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _cancel_schedule(self) -> None:
+        if self._after_id:
+            self.widget.after_cancel(self._after_id)
+            self._after_id = None
+
+    def _show(self) -> None:
+        self._after_id = None
+        if self._tip_window or not self.text:
+            return
+        x = self.widget.winfo_rootx() + (self.widget.winfo_width() // 2)
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_attributes("-topmost", True)
+        label = tk.Label(
+            tip,
+            text=self.text,
+            justify="center",
+            background="#111827",
+            foreground="#f9fafb",
+            relief="solid",
+            borderwidth=1,
+            highlightthickness=0,
+            padx=8,
+            pady=4,
+            font=("Segoe UI", 9),
+        )
+        label.pack()
+        tip.update_idletasks()
+        tip_width = tip.winfo_width()
+        tip.wm_geometry(f"+{max(0, x - tip_width // 2)}+{y}")
+        self._tip_window = tip
+
+    def _on_leave(self, _event=None):
+        self._cancel_schedule()
+        if self._tip_window:
+            self._tip_window.destroy()
+            self._tip_window = None
+
+
+class IconToolbarButton(ctk.CTkFrame):
+    """Icon-only toolbar control using tk.PhotoImage (avoids CTkImage scaling bugs)."""
+
+    def __init__(
+        self,
+        master,
+        pil_image: Image.Image,
+        command,
+        size: int = 36,
+        fg_color: str = "#374151",
+        hover_color: str = "#4b5563",
+        disabled_color: str = "#1f2937",
+        pil_image_disabled: Image.Image | None = None,
+        state: str = "normal",
+        corner_radius: int = 6,
+        **kwargs,
+    ):
+        super().__init__(
+            master,
+            width=size,
+            height=size,
+            fg_color=fg_color,
+            corner_radius=corner_radius,
+            **kwargs,
+        )
+        self.grid_propagate(False)
+        self.pack_propagate(False)
+        self._command = command
+        self._fg_color = fg_color
+        self._hover_color = hover_color
+        self._disabled_color = disabled_color
+        self._state = state
+        self._photo_enabled = ImageTk.PhotoImage(pil_image)
+        self._photo_disabled = ImageTk.PhotoImage(pil_image)
+        self._icon_label = tk.Label(
+            self,
+            image=self._photo_enabled,
+            borderwidth=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        self._icon_label.place(relx=0.5, rely=0.5, anchor="center")
+        for widget in (self, self._icon_label):
+            widget.bind("<Enter>", self._on_enter)
+            widget.bind("<Leave>", self._on_leave)
+            widget.bind("<Button-1>", self._on_click)
+        self.set_icon_images(pil_image, pil_image_disabled)
+        self._state = state
+        self._apply_state()
+
+    def configure(self, cnf=None, **kwargs):
+        if cnf:
+            kwargs.update(cnf)
+        if "state" in kwargs:
+            self._state = kwargs.pop("state")
+        if "fg_color" in kwargs:
+            self._fg_color = kwargs.pop("fg_color")
+        if "hover_color" in kwargs:
+            self._hover_color = kwargs.pop("hover_color")
+        if "command" in kwargs:
+            self._command = kwargs.pop("command")
+        if "pil_image" in kwargs:
+            pil_image = kwargs.pop("pil_image")
+            self.set_icon_images(pil_image, kwargs.pop("pil_image_disabled", None))
+        if "pil_image_disabled" in kwargs:
+            self.set_icon_images(
+                kwargs.pop("pil_image", self._pil_image_enabled),
+                kwargs.pop("pil_image_disabled"),
+            )
+        self._apply_state()
+        super().configure(**kwargs)
+
+    def set_icon_images(
+        self,
+        enabled_image: Image.Image,
+        disabled_image: Image.Image | None = None,
+    ) -> None:
+        from toolbar_icons import dim_toolbar_icon
+
+        self._pil_image_enabled = enabled_image
+        self._pil_image_disabled = (
+            disabled_image
+            if disabled_image is not None
+            else dim_toolbar_icon(enabled_image)
+        )
+        self._photo_enabled = ImageTk.PhotoImage(self._pil_image_enabled)
+        self._photo_disabled = ImageTk.PhotoImage(self._pil_image_disabled)
+        self._apply_state()
+
+    def cget(self, key):
+        if key == "state":
+            return self._state
+        return super().cget(key)
+
+    def _current_bg(self) -> str:
+        if self._state == "disabled":
+            return self._disabled_color
+        return self._fg_color
+
+    def _apply_state(self) -> None:
+        bg = self._current_bg()
+        is_disabled = self._state == "disabled"
+        super().configure(fg_color=bg)
+        self._icon_label.configure(
+            image=self._photo_disabled if is_disabled else self._photo_enabled,
+            bg=bg,
+            cursor="arrow" if is_disabled else "hand2",
+        )
+
+    def _on_enter(self, _event=None) -> None:
+        if self._state != "disabled":
+            super().configure(fg_color=self._hover_color)
+            self._icon_label.configure(bg=self._hover_color)
+
+    def _on_leave(self, _event=None) -> None:
+        self._apply_state()
+
+    def _on_click(self, _event=None) -> None:
+        if self._state != "disabled" and self._command:
+            self._command()
+
+
 def is_free_cell_text(text: str) -> bool:
     normalized = "".join(char for char in text.upper() if char.isalpha())
     return normalized == "FREE"
@@ -45,6 +243,28 @@ def normalize_song_name(text: str) -> str:
     while cleaned.startswith("-"):
         cleaned = cleaned[1:].lstrip()
     return cleaned
+
+
+def canonical_music_name(text: str) -> str:
+    return normalize_song_name(normalize_cell_text(text))
+
+
+def song_identity_key(text: str) -> str:
+    """Match the same track across cards even when PDF text includes artists differently."""
+    base = canonical_music_name(text)
+    if not base:
+        return ""
+
+    lowered = base.casefold()
+    cut = len(base)
+    for marker in (" (feat.", " (ft.", " (featuring ", " - "):
+        index = lowered.find(marker)
+        if index != -1:
+            cut = min(cut, index)
+
+    title = base[:cut].strip()
+    title = re.sub(r"\s+", " ", title).strip()
+    return title.casefold() if title else lowered
 
 
 def kmeans_1d(values: list[float], k: int, iterations: int = 30) -> list[float]:
@@ -103,148 +323,34 @@ def extract_filtered_words(page) -> list[dict]:
     ]
     cutoff_top = min(card_word_tops) + 20 if card_word_tops else 0
     return [word for word in words if word["top"] > cutoff_top and word["text"].strip()]
-    
 
 
-def detect_main_grid_box(gray_image: np.ndarray) -> tuple[int, int, int, int] | None:
-    edges = cv2.Canny(gray_image, 80, 150)
-    contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    image_h, image_w = gray_image.shape[:2]
-    image_area = image_w * image_h
-
-    best_box = None
-    best_area = 0
-
-    for contour in contours:
-        approx = cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True)
-        if len(approx) < 4:
-            continue
-
-        x, y, w, h = cv2.boundingRect(approx)
-        area = w * h
-        aspect_ratio = w / h if h else 0
-        if area < image_area * 0.08:
-            continue
-        if not (0.65 <= aspect_ratio <= 1.35):
-            continue
-        if area > best_area:
-            best_area = area
-            best_box = (x, y, w, h)
-
-    return best_box
-
-
-def cluster_line_positions(indices: np.ndarray, tolerance: int = 8) -> list[int]:
-    if indices.size == 0:
-        return []
-
-    sorted_indices = sorted(int(value) for value in indices.tolist())
-    groups: list[list[int]] = [[sorted_indices[0]]]
-    for value in sorted_indices[1:]:
-        if value - groups[-1][-1] <= tolerance:
-            groups[-1].append(value)
-        else:
-            groups.append([value])
-    return [int(round(sum(group) / len(group))) for group in groups]
-
-
-def snap_to_expected_lines(line_positions: list[int], expected_count: int) -> list[int]:
-    if not line_positions:
-        return []
-    line_positions = sorted(line_positions)
-    if len(line_positions) == expected_count:
-        return line_positions
-    if len(line_positions) < 2:
-        return line_positions
-
-    left = line_positions[0]
-    right = line_positions[-1]
-    step = (right - left) / (expected_count - 1)
-    snapped: list[int] = []
-    for index in range(expected_count):
-        target = left + (index * step)
-        nearest = min(line_positions, key=lambda value, t=target: abs(value - t))
-        if snapped and nearest <= snapped[-1]:
-            nearest = snapped[-1] + max(1, int(step * 0.5))
-        snapped.append(nearest)
-
-    return snapped
-
-
-def derive_grid_lines(binary_crop: np.ndarray, grid_size: int) -> tuple[list[int], list[int]]:
-    crop_h, crop_w = binary_crop.shape[:2]
-    vertical_projection = binary_crop.sum(axis=0) / 255.0
-    horizontal_projection = binary_crop.sum(axis=1) / 255.0
-
-    vertical_hits = np.nonzero(vertical_projection > (crop_h * 0.45))[0]
-    horizontal_hits = np.nonzero(horizontal_projection > (crop_w * 0.45))[0]
-
-    x_lines = cluster_line_positions(vertical_hits, tolerance=max(6, crop_w // 140))
-    y_lines = cluster_line_positions(horizontal_hits, tolerance=max(6, crop_h // 140))
-
-    expected = grid_size + 1
-    x_lines = snap_to_expected_lines(x_lines, expected)
-    y_lines = snap_to_expected_lines(y_lines, expected)
-
-    # Keep detected outer lines, but nudge them slightly inward to avoid drawing
-    # over rounded template borders.
-    outer_inset_x = max(1, crop_w // 220)
-    outer_inset_y = max(1, crop_h // 220)
-    if len(x_lines) == expected:
-        x_lines[0] = min(crop_w - 2, x_lines[0] + outer_inset_x)
-        x_lines[-1] = max(1, x_lines[-1] - outer_inset_x)
-    if len(y_lines) == expected:
-        y_lines[0] = min(crop_h - 2, y_lines[0] + outer_inset_y)
-        y_lines[-1] = max(1, y_lines[-1] - outer_inset_y)
-
-    # Extra stabilization for right outer border: align to strongest long vertical line.
-    if len(x_lines) == expected:
-        strong_vertical = np.nonzero(vertical_projection > (crop_h * 0.6))[0]
-        if strong_vertical.size > 0:
-            right_candidate = int(strong_vertical[-1]) - outer_inset_x
-            min_allowed = x_lines[-2] + max(6, crop_w // (grid_size * 6))
-            x_lines[-1] = max(min_allowed, min(crop_w - 1, right_candidate))
-
-        # If the last column width is an outlier (common right-edge overshoot),
-        # snap it to the expected spacing pattern.
-        x_steps = [x_lines[i + 1] - x_lines[i] for i in range(len(x_lines) - 1)]
-        if len(x_steps) >= 3:
-            median_step = int(np.median(x_steps[:-1]))
-            if median_step > 0 and x_steps[-1] > int(median_step * 1.35):
-                corrected_right = x_lines[0] + (median_step * grid_size)
-                min_allowed = x_lines[-2] + max(4, median_step // 2)
-                x_lines[-1] = max(min_allowed, min(crop_w - 1, corrected_right))
-    return x_lines, y_lines
-
-
-def detect_grid_cells_precise(template_image: Image.Image, grid_size: int) -> list[dict]:
-    cv_image = cv2.cvtColor(np.array(template_image.convert("RGB")), cv2.COLOR_RGB2BGR)
-    gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-    grid_box = detect_main_grid_box(gray)
-    if not grid_box:
-        return detect_grid_cells_fallback(template_image, grid_size)
-
-    x, y, w, h = grid_box
-    crop = gray[y : y + h, x : x + w]
-    binary = cv2.adaptiveThreshold(
-        crop, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 12
-    )
-    x_lines, y_lines = derive_grid_lines(binary, grid_size)
-    if len(x_lines) != grid_size + 1 or len(y_lines) != grid_size + 1:
-        return detect_grid_cells_fallback(template_image, grid_size)
-
-    x_lines = [x + value for value in x_lines]
-    y_lines = [y + value for value in y_lines]
+def build_default_grid_cells(
+    image_width: int,
+    image_height: int,
+    grid_size: int,
+) -> list[dict]:
+    """Place a centered square grid in the lower portion of the template."""
+    margin_x = max(20, int(image_width * 0.075))
+    top_margin = max(20, int(image_height * 0.34))
+    bottom_margin = max(20, int(image_height * 0.04))
+    available_w = image_width - (2 * margin_x)
+    available_h = image_height - top_margin - bottom_margin
+    grid_span = min(available_w, available_h)
+    start_x = margin_x + (available_w - grid_span) // 2
+    start_y = top_margin + (available_h - grid_span) // 2
+    cell_size = max(20, grid_span // grid_size)
+    actual_span = cell_size * grid_size
+    start_x += (grid_span - actual_span) // 2
+    start_y += (grid_span - actual_span) // 2
 
     cells: list[dict] = []
     for row in range(grid_size):
         for col in range(grid_size):
-            x1 = x_lines[col]
-            x2 = x_lines[col + 1]
-            y1 = y_lines[row]
-            y2 = y_lines[row + 1]
-            cell_w = max(1, x2 - x1)
-            cell_h = max(1, y2 - y1)
+            x1 = start_x + (col * cell_size)
+            y1 = start_y + (row * cell_size)
+            x2 = x1 + cell_size
+            y2 = y1 + cell_size
             cells.append(
                 {
                     "row": row,
@@ -253,73 +359,13 @@ def detect_grid_cells_precise(template_image: Image.Image, grid_size: int) -> li
                     "y1": y1,
                     "x2": x2,
                     "y2": y2,
-                    "center_x": x1 + (cell_w // 2),
-                    "center_y": y1 + (cell_h // 2),
-                    "width": cell_w,
-                    "height": cell_h,
+                    "center_x": x1 + (cell_size // 2),
+                    "center_y": y1 + (cell_size // 2),
+                    "width": cell_size,
+                    "height": cell_size,
                 }
             )
     return cells
-
-
-def unique_positions(values: list[int], tolerance: int = 3) -> list[int]:
-    if not values:
-        return []
-    sorted_values = sorted(values)
-    groups: list[list[int]] = [[sorted_values[0]]]
-    for value in sorted_values[1:]:
-        if abs(value - groups[-1][-1]) <= tolerance:
-            groups[-1].append(value)
-        else:
-            groups.append([value])
-    return [int(round(sum(group) / len(group))) for group in groups]
-
-
-def score_grid_alignment(edges: np.ndarray, cells: list[dict], size: int) -> float:
-    if not cells:
-        return -1.0
-    x_lines = unique_positions(
-        [cell["x1"] for cell in cells] + [cell["x2"] for cell in cells]
-    )
-    y_lines = unique_positions(
-        [cell["y1"] for cell in cells] + [cell["y2"] for cell in cells]
-    )
-    if len(x_lines) != size + 1 or len(y_lines) != size + 1:
-        return -1.0
-
-    edge_h, edge_w = edges.shape[:2]
-    band = 2
-    values: list[float] = []
-
-    for x in x_lines:
-        x0 = max(0, x - band)
-        x1 = min(edge_w, x + band + 1)
-        if x1 > x0:
-            values.append(float(edges[:, x0:x1].mean()))
-    for y in y_lines:
-        y0 = max(0, y - band)
-        y1 = min(edge_h, y + band + 1)
-        if y1 > y0:
-            values.append(float(edges[y0:y1, :].mean()))
-
-    return float(sum(values) / len(values)) if values else -1.0
-
-
-def detect_template_layout(template_image: Image.Image) -> int:
-    cv_image = cv2.cvtColor(np.array(template_image.convert("RGB")), cv2.COLOR_RGB2BGR)
-    gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 80, 150)
-
-    best_size = 5
-    best_score = -1.0
-    for size in SUPPORTED_GRID_SIZES:
-        cells = detect_grid_cells_fallback(template_image, size)
-        score = score_grid_alignment(edges, cells, size)
-        if score > best_score:
-            best_score = score
-            best_size = size
-
-    return best_size
 
 
 def detect_pdf_layout(pdf_path: Path) -> int:
@@ -366,7 +412,7 @@ def extract_first_card_matrix(pdf_path: Path, grid_size: int) -> list[list[str]]
                         cells[row][col], key=lambda word: (word["top"], word["x0"])
                     )
                     raw_name = " ".join(word["text"] for word in bucket).strip()
-                    row_values.append(normalize_song_name(raw_name))
+                    row_values.append(canonical_music_name(raw_name))
                 matrix.append(row_values)
             return matrix
     return None
@@ -457,8 +503,12 @@ def draw_free_image_in_cell(
 
     paste_x = (cell["center_x"] - badge.width // 2) + text_offset_x
     paste_y = (cell["center_y"] - badge.height // 2) + text_offset_y
-    paste_x = max(cell["x1"] + padding, min(paste_x, cell["x2"] - padding - badge.width))
-    paste_y = max(cell["y1"] + padding, min(paste_y, cell["y2"] - padding - badge.height))
+    paste_x = max(
+        cell["x1"] + padding, min(paste_x, cell["x2"] - padding - badge.width)
+    )
+    paste_y = max(
+        cell["y1"] + padding, min(paste_y, cell["y2"] - padding - badge.height)
+    )
     image.paste(badge, (paste_x, paste_y), badge)
 
 
@@ -470,24 +520,16 @@ def get_placeholder_matrix(grid_size: int) -> list[list[str]]:
 
 
 def build_uniform_grid_cells(
-    reference_cells: list[dict],
     grid_size: int,
-    offset_x: int,
-    offset_y: int,
-    cell_width_adjust: int,
-    cell_height_adjust: int,
+    grid_x: int,
+    grid_y: int,
+    cell_width: int,
+    cell_height: int,
 ) -> list[dict]:
-    if not reference_cells:
-        return []
-
-    start_x = min(cell["x1"] for cell in reference_cells) + offset_x
-    start_y = min(cell["y1"] for cell in reference_cells) + offset_y
-    detected_widths = [cell["width"] for cell in reference_cells]
-    detected_heights = [cell["height"] for cell in reference_cells]
-    base_cell_width = int(round(float(np.median(detected_widths)))) if detected_widths else 120
-    base_cell_height = int(round(float(np.median(detected_heights)))) if detected_heights else 120
-    cell_width = max(20, base_cell_width + cell_width_adjust)
-    cell_height = max(20, base_cell_height + cell_height_adjust)
+    cell_width = max(20, cell_width)
+    cell_height = max(20, cell_height)
+    start_x = grid_x
+    start_y = grid_y
 
     uniform_cells: list[dict] = []
     for row in range(grid_size):
@@ -522,12 +564,13 @@ def build_preview(
     text_offset_x: int,
     text_offset_y: int,
     free_icon_size: float,
-    grid_offset_x: int,
-    grid_offset_y: int,
-    manual_cell_width: int,
-    manual_cell_height: int,
+    grid_x: int,
+    grid_y: int,
+    cell_width: int,
+    cell_height: int,
     show_grid_overlay: bool,
     free_image_path: Path | None = None,
+    free_image: Image.Image | None = None,
 ) -> Image.Image:
     preview = template_image.convert("RGB").copy()
     draw = ImageDraw.Draw(preview)
@@ -538,19 +581,16 @@ def build_preview(
         font = ImageFont.load_default()
 
     fill_color = tuple(int(text_color_hex[i : i + 2], 16) for i in (1, 3, 5))
-    free_image = None
-    candidate_path = free_image_path or FREE_IMAGE_PATH
-    if candidate_path.exists():
-        free_image = Image.open(candidate_path).convert("RGBA")
-    cells = detect_grid_cells_precise(preview, grid_size)
-    cells = sorted(cells, key=lambda c: (c["row"], c["col"]))
+    if free_image is None:
+        candidate_path = free_image_path or FREE_IMAGE_PATH
+        if candidate_path.exists():
+            free_image = Image.open(candidate_path).convert("RGBA")
     cells = build_uniform_grid_cells(
-        reference_cells=cells,
         grid_size=grid_size,
-        offset_x=grid_offset_x,
-        offset_y=grid_offset_y,
-        cell_width_adjust=manual_cell_width,
-        cell_height_adjust=manual_cell_height,
+        grid_x=grid_x,
+        grid_y=grid_y,
+        cell_width=cell_width,
+        cell_height=cell_height,
     )
 
     for cell in cells:
@@ -601,7 +641,6 @@ class BingoDesktopApp(ctk.CTk):
         self.template_path: Path | None = None
         self.pdf_path: Path | None = None
         self.template_image: Image.Image | None = None
-        self.template_layout: int | None = None
         self.pdf_layout: int | None = None
         self.output_dir: Path | None = None
         self.free_icon_path: Path | None = None
@@ -614,6 +653,8 @@ class BingoDesktopApp(ctk.CTk):
         self._preview_h_scroll_visible = True
         self._preview_v_scroll_visible = True
         self.cached_pdf_cards: list[dict] | None = None
+        self.playlist_tracks: list[dict] = []
+        self.playlist_include_artist: bool = False
         self.music_name_overrides: dict[str, str] = {}
         self.tutorial_seen = False
         self._tutorial_tooltip: ctk.CTkToplevel | None = None
@@ -621,20 +662,40 @@ class BingoDesktopApp(ctk.CTk):
         self._tutorial_target_restore: dict[str, object] | None = None
         self._tutorial_steps: list[dict] = []
         self._tutorial_step_index = 0
+        self._tutorial_import_dialog: ctk.CTkToplevel | None = None
+        self._tutorial_music_editor_dialog: ctk.CTkToplevel | None = None
 
         self.text_color_var = tk.StringVar(value="#000000")
         self.font_size_var = tk.IntVar(value=26)
         self.text_offset_x_var = tk.IntVar(value=0)
         self.text_offset_y_var = tk.IntVar(value=0)
         self.free_icon_size_var = tk.DoubleVar(value=FREE_ICON_SIZE_DEFAULT)
-        self.grid_offset_x_var = tk.IntVar(value=0)
-        self.grid_offset_y_var = tk.IntVar(value=0)
-        self.manual_cell_width_var = tk.IntVar(value=0)
-        self.manual_cell_height_var = tk.IntVar(value=0)
+        self.grid_x_var = tk.IntVar(value=0)
+        self.grid_y_var = tk.IntVar(value=0)
+        self.grid_cell_width_var = tk.IntVar(value=120)
+        self.grid_cell_height_var = tk.IntVar(value=120)
         self.show_grid_overlay_var = tk.BooleanVar(value=True)
         self.grid_settings_expanded = False
         self.text_settings_expanded = False
         self._loading_state = False
+        self._customize_history_suppressed = False
+        self._customize_undo_stack: list[dict] = []
+        self._customize_redo_stack: list[dict] = []
+        self._customize_active_action_key: str | None = None
+        self._preview_refresh_after_id: str | None = None
+        self._save_state_after_id: str | None = None
+        self._cached_preview_matrix: list[list[str]] | None = None
+        self._cached_preview_matrix_key: tuple | None = None
+        self._pending_legacy_grid_offsets: tuple[int, int] | None = None
+        self._pending_legacy_cell_adjustments: tuple[int, int] | None = None
+        self._cached_free_image: Image.Image | None = None
+        self._cached_free_image_path: Path | None = None
+        self.spotify_playlist_url_var = tk.StringVar(value="")
+        self.spotify_grid_size_var = tk.StringVar(value="5x5")
+        self.spotify_card_count_var = tk.IntVar(value=20)
+        self.spotify_include_artist_var = tk.BooleanVar(value=False)
+        self.spotify_free_center_var = tk.BooleanVar(value=True)
+        self.spotify_downloaded_pdf_path: Path | None = None
 
         self._build_layout()
         self._load_state()
@@ -645,8 +706,13 @@ class BingoDesktopApp(ctk.CTk):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        controls = ctk.CTkScrollableFrame(self, corner_radius=12, width=380)
-        controls.grid(row=0, column=0, sticky="nsw", padx=(16, 8), pady=16)
+        left_panel = ctk.CTkFrame(self, fg_color="transparent", width=380)
+        left_panel.grid(row=0, column=0, sticky="nsw", padx=(16, 8), pady=16)
+        left_panel.grid_columnconfigure(0, weight=1)
+        left_panel.grid_rowconfigure(0, weight=1)
+
+        controls = ctk.CTkScrollableFrame(left_panel, corner_radius=12, width=380)
+        controls.grid(row=0, column=0, sticky="nsew")
         controls.grid_columnconfigure(0, weight=1)
         self.controls_scrollable = controls
 
@@ -671,27 +737,26 @@ class BingoDesktopApp(ctk.CTk):
             fg_color="#2563eb",
             hover_color="#1d4ed8",
         )
-        self.select_template_button.grid(row=2, column=0, padx=16, pady=(0, 10), sticky="ew")
-
-        self.template_layout_label = ctk.CTkLabel(
-            controls, text="Template layout: -", anchor="w"
-        )
-        self.template_layout_label.grid(
-            row=3, column=0, padx=16, pady=(0, 14), sticky="ew"
+        self.select_template_button.grid(
+            row=2, column=0, padx=16, pady=(0, 10), sticky="ew"
         )
 
-        self.import_pdf_button = ctk.CTkButton(
+        self.spotify_import_button = ctk.CTkButton(
             controls,
-            text="Import Cards PDF",
-            command=self._select_pdf,
+            text="Import from Spotify Playlist",
+            command=self._open_spotify_import_dialog,
             height=36,
             fg_color="#0ea5e9",
             hover_color="#0284c7",
         )
-        self.import_pdf_button.grid(row=4, column=0, padx=16, pady=(0, 10), sticky="ew")
+        self.spotify_import_button.grid(
+            row=3, column=0, padx=16, pady=(0, 10), sticky="ew"
+        )
 
-        self.pdf_layout_label = ctk.CTkLabel(controls, text="PDF layout: -", anchor="w")
-        self.pdf_layout_label.grid(row=5, column=0, padx=16, pady=(0, 14), sticky="ew")
+        self.pdf_layout_label = ctk.CTkLabel(
+            controls, text="Grid layout: -", anchor="w"
+        )
+        self.pdf_layout_label.grid(row=4, column=0, padx=16, pady=(0, 14), sticky="ew")
         self.edit_music_button = ctk.CTkButton(
             controls,
             text="Edit Music Names",
@@ -701,17 +766,17 @@ class BingoDesktopApp(ctk.CTk):
             hover_color="#6d28d9",
             state="disabled",
         )
-        self.edit_music_button.grid(row=6, column=0, padx=16, pady=(0, 12), sticky="ew")
+        self.edit_music_button.grid(row=5, column=0, padx=16, pady=(0, 12), sticky="ew")
 
         ctk.CTkFrame(controls, height=2, fg_color="#6b7280", corner_radius=0).grid(
-            row=7, column=0, padx=16, pady=(4, 12), sticky="ew"
+            row=6, column=0, padx=16, pady=(4, 12), sticky="ew"
         )
         ctk.CTkLabel(
             controls,
             text="Customize",
             text_color="#9ca3af",
             font=ctk.CTkFont(size=12, weight="bold"),
-        ).grid(row=8, column=0, padx=16, pady=(0, 6), sticky="w")
+        ).grid(row=7, column=0, padx=16, pady=(0, 6), sticky="w")
 
         self.text_settings_toggle_button = ctk.CTkButton(
             controls,
@@ -722,7 +787,7 @@ class BingoDesktopApp(ctk.CTk):
             hover_color="#4b5563",
         )
         self.text_settings_toggle_button.grid(
-            row=9, column=0, padx=16, pady=(0, 10), sticky="ew"
+            row=8, column=0, padx=16, pady=(0, 10), sticky="ew"
         )
 
         self.text_settings_frame = ctk.CTkFrame(controls, corner_radius=8)
@@ -734,8 +799,13 @@ class BingoDesktopApp(ctk.CTk):
         ctk.CTkLabel(color_row, text="Text Color (#RRGGBB)").grid(
             row=0, column=0, padx=(0, 8), sticky="w"
         )
-        ctk.CTkEntry(color_row, textvariable=self.text_color_var, width=110).grid(
-            row=0, column=1, padx=(0, 6), sticky="e"
+        self.text_color_entry = ctk.CTkEntry(
+            color_row, textvariable=self.text_color_var, width=110
+        )
+        self.text_color_entry.grid(row=0, column=1, padx=(0, 6), sticky="e")
+        self.text_color_entry.bind(
+            "<FocusIn>",
+            lambda _event: self._stash_customize_undo("entry:text_color"),
         )
         ctk.CTkButton(
             color_row,
@@ -815,13 +885,15 @@ class BingoDesktopApp(ctk.CTk):
             hover_color="#4b5563",
         )
         self.grid_settings_toggle_button.grid(
-            row=11, column=0, padx=16, pady=(0, 12), sticky="ew"
+            row=10, column=0, padx=16, pady=(0, 12), sticky="ew"
         )
 
         self.grid_settings_frame = ctk.CTkFrame(controls, corner_radius=8)
         self.grid_settings_frame.grid_columnconfigure(0, weight=1)
 
-        grid_overlay_row = ctk.CTkFrame(self.grid_settings_frame, fg_color="transparent")
+        grid_overlay_row = ctk.CTkFrame(
+            self.grid_settings_frame, fg_color="transparent"
+        )
         grid_overlay_row.grid(row=0, column=0, padx=10, pady=(10, 8), sticky="ew")
         grid_overlay_row.grid_columnconfigure(0, weight=1)
         grid_overlay_row.grid_columnconfigure(1, weight=0)
@@ -842,60 +914,51 @@ class BingoDesktopApp(ctk.CTk):
             width=46,
             switch_width=36,
             variable=self.show_grid_overlay_var,
-            command=self._refresh_preview,
+            command=self._on_grid_overlay_toggled,
         )
         self.grid_overlay_switch.grid(row=0, column=0, sticky="e")
 
-        self.grid_offset_x_value_label = self._create_stepper_row(
+        self.grid_x_value_label = self._create_stepper_row(
             self.grid_settings_frame,
             row=1,
-            label="Grid Offset X",
-            variable=self.grid_offset_x_var,
-            minimum=-300,
-            maximum=300,
+            label="Grid X",
+            variable=self.grid_x_var,
+            minimum=0,
+            maximum=4096,
         )
-        self.grid_offset_y_value_label = self._create_stepper_row(
+        self.grid_y_value_label = self._create_stepper_row(
             self.grid_settings_frame,
             row=2,
-            label="Grid Offset Y",
-            variable=self.grid_offset_y_var,
-            minimum=-300,
-            maximum=300,
+            label="Grid Y",
+            variable=self.grid_y_var,
+            minimum=0,
+            maximum=4096,
         )
-        self.manual_cell_width_value_label = self._create_stepper_row(
+        self.grid_cell_width_value_label = self._create_stepper_row(
             self.grid_settings_frame,
             row=3,
-            label="Cell Width Adjust",
-            variable=self.manual_cell_width_var,
-            minimum=-120,
-            maximum=120,
+            label="Cell Width",
+            variable=self.grid_cell_width_var,
+            minimum=20,
+            maximum=1024,
         )
-        self.manual_cell_height_value_label = self._create_stepper_row(
+        self.grid_cell_height_value_label = self._create_stepper_row(
             self.grid_settings_frame,
             row=4,
-            label="Cell Height Adjust",
-            variable=self.manual_cell_height_var,
-            minimum=-120,
-            maximum=120,
+            label="Cell Height",
+            variable=self.grid_cell_height_var,
+            minimum=20,
+            maximum=1024,
         )
-        ctk.CTkButton(
-            controls,
-            text="Reset Configs",
-            command=self._reset_configs,
-            height=34,
-            fg_color="#6b7280",
-            hover_color="#4b5563",
-        ).grid(row=13, column=0, padx=16, pady=(10, 12), sticky="ew")
-
         ctk.CTkFrame(controls, height=2, fg_color="#6b7280", corner_radius=0).grid(
-            row=14, column=0, padx=16, pady=(2, 12), sticky="ew"
+            row=12, column=0, padx=16, pady=(10, 12), sticky="ew"
         )
         ctk.CTkLabel(
             controls,
             text="Output",
             text_color="#9ca3af",
             font=ctk.CTkFont(size=12, weight="bold"),
-        ).grid(row=15, column=0, padx=16, pady=(0, 6), sticky="w")
+        ).grid(row=14, column=0, padx=16, pady=(0, 6), sticky="w")
         self.output_folder_button = ctk.CTkButton(
             controls,
             text=self._format_output_button_text(),
@@ -904,7 +967,9 @@ class BingoDesktopApp(ctk.CTk):
             fg_color="#0891b2",
             hover_color="#0e7490",
         )
-        self.output_folder_button.grid(row=16, column=0, padx=16, pady=(0, 10), sticky="ew")
+        self.output_folder_button.grid(
+            row=15, column=0, padx=16, pady=(0, 10), sticky="ew"
+        )
         ctk.CTkButton(
             controls,
             text="Open Generated Folder",
@@ -912,18 +977,17 @@ class BingoDesktopApp(ctk.CTk):
             height=34,
             fg_color="#475569",
             hover_color="#334155",
-        ).grid(row=17, column=0, padx=16, pady=(0, 12), sticky="ew")
+        ).grid(row=16, column=0, padx=16, pady=(0, 12), sticky="ew")
 
         ctk.CTkFrame(controls, height=2, fg_color="#6b7280", corner_radius=0).grid(
-            row=18, column=0, padx=16, pady=(2, 12), sticky="ew"
+            row=17, column=0, padx=16, pady=(2, 12), sticky="ew"
         )
         ctk.CTkLabel(
             controls,
             text="Run",
             text_color="#9ca3af",
             font=ctk.CTkFont(size=12, weight="bold"),
-        ).grid(row=19, column=0, padx=16, pady=(0, 6), sticky="w")
-
+        ).grid(row=18, column=0, padx=16, pady=(0, 6), sticky="w")
         self.generate_button = ctk.CTkButton(
             controls,
             text="Generate Cards",
@@ -939,54 +1003,126 @@ class BingoDesktopApp(ctk.CTk):
         self.generate_status_label = ctk.CTkLabel(
             controls, text="Generation status: idle", anchor="w", text_color="#9ca3af"
         )
-        self.generate_status_label.grid(row=22, column=0, padx=16, pady=(0, 16), sticky="ew")
+        self.generate_status_label.grid(
+            row=22, column=0, padx=16, pady=(0, 16), sticky="ew"
+        )
         self.tutorial_button = ctk.CTkButton(
-            controls,
+            left_panel,
             text="Start Tutorial Tour",
             command=self._start_tutorial,
             height=34,
             fg_color="#4f46e5",
             hover_color="#4338ca",
         )
-        self.tutorial_button.grid(row=23, column=0, padx=16, pady=(0, 14), sticky="ew")
+        self.tutorial_button.grid(row=1, column=0, padx=16, pady=(8, 0), sticky="ew")
 
         preview_frame = ctk.CTkFrame(self, corner_radius=12)
         preview_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=16)
         preview_frame.grid_columnconfigure(0, weight=1)
         preview_frame.grid_rowconfigure(1, weight=1)
 
+        preview_header = ctk.CTkFrame(preview_frame, fg_color="transparent")
+        preview_header.grid(row=0, column=0, padx=18, pady=(16, 10), sticky="ew")
+        preview_header.grid_columnconfigure(0, weight=1)
+
         ctk.CTkLabel(
-            preview_frame,
+            preview_header,
             text="Live Preview",
             font=ctk.CTkFont(size=22, weight="bold"),
-        ).grid(row=0, column=0, padx=18, pady=(16, 10), sticky="w")
+        ).grid(row=0, column=0, sticky="w")
 
-        preview_toolbar = ctk.CTkFrame(preview_frame, fg_color="transparent")
-        preview_toolbar.grid(row=0, column=0, padx=18, pady=(16, 10), sticky="e")
-        ctk.CTkButton(
+        preview_toolbar = ctk.CTkFrame(preview_header, fg_color="transparent")
+        preview_toolbar.grid(row=0, column=1, sticky="e")
+
+        icon_pixel_size = 24
+        toolbar_button_size = 36
+
+        undo_icon_on = load_toolbar_icon("undo", icon_pixel_size, enabled=True)
+        undo_icon_off = load_toolbar_icon("undo", icon_pixel_size, enabled=False)
+        redo_icon_on = load_toolbar_icon("redo", icon_pixel_size, enabled=True)
+        redo_icon_off = load_toolbar_icon("redo", icon_pixel_size, enabled=False)
+
+        self.undo_customize_button = IconToolbarButton(
             preview_toolbar,
-            text="-",
-            width=30,
+            pil_image=undo_icon_on,
+            pil_image_disabled=undo_icon_off,
+            command=self._undo_customize,
+            size=toolbar_button_size,
+            state="disabled",
+        )
+        self.undo_customize_button.grid(row=0, column=0, padx=(0, 4))
+
+        self.redo_customize_button = IconToolbarButton(
+            preview_toolbar,
+            pil_image=redo_icon_on,
+            pil_image_disabled=redo_icon_off,
+            command=self._redo_customize,
+            size=toolbar_button_size,
+            state="disabled",
+        )
+        self.redo_customize_button.grid(row=0, column=1, padx=(0, 4))
+
+        self.reset_customize_button = IconToolbarButton(
+            preview_toolbar,
+            pil_image=load_toolbar_icon("reset", icon_pixel_size),
+            command=self._reset_configs,
+            size=toolbar_button_size,
+            fg_color="#6b7280",
+        )
+        self.reset_customize_button.grid(row=0, column=2, padx=(0, 10))
+
+        ctk.CTkFrame(
+            preview_toolbar, width=1, height=toolbar_button_size - 6, fg_color="#6b7280"
+        ).grid(row=0, column=3, padx=(0, 10))
+
+        zoom_button_fg = "#2563eb"
+        zoom_button_hover = "#1d4ed8"
+
+        self.zoom_out_button = IconToolbarButton(
+            preview_toolbar,
+            pil_image=load_toolbar_icon("minus", icon_pixel_size),
             command=self._zoom_out,
-        ).grid(row=0, column=0, padx=(0, 6))
-        ctk.CTkLabel(
+            size=toolbar_button_size,
+            fg_color=zoom_button_fg,
+            hover_color=zoom_button_hover,
+        )
+        self.zoom_out_button.grid(row=0, column=4, padx=(0, 6))
+        self.preview_zoom_label = ctk.CTkLabel(
             preview_toolbar,
             textvariable=self.preview_zoom_label_var,
             width=56,
             anchor="center",
-        ).grid(row=0, column=1, padx=(0, 6))
-        ctk.CTkButton(
+        )
+        self.preview_zoom_label.grid(row=0, column=5, padx=(0, 6))
+        self.zoom_in_button = IconToolbarButton(
             preview_toolbar,
-            text="+",
-            width=30,
+            pil_image=load_toolbar_icon("plus", icon_pixel_size),
             command=self._zoom_in,
-        ).grid(row=0, column=2, padx=(0, 6))
-        ctk.CTkButton(
+            size=toolbar_button_size,
+            fg_color=zoom_button_fg,
+            hover_color=zoom_button_hover,
+        )
+        self.zoom_in_button.grid(row=0, column=6, padx=(0, 6))
+        self.zoom_fit_button = IconToolbarButton(
             preview_toolbar,
-            text="Reset",
-            width=64,
+            pil_image=load_toolbar_icon("fit", icon_pixel_size),
             command=self._zoom_reset,
-        ).grid(row=0, column=3)
+            size=toolbar_button_size,
+        )
+        self.zoom_fit_button.grid(row=0, column=7)
+
+        self._preview_tooltips = [
+            HoverToolTip(self.undo_customize_button, "Undo customize change (Ctrl+Z)"),
+            HoverToolTip(self.redo_customize_button, "Redo customize change (Ctrl+Y)"),
+            HoverToolTip(
+                self.reset_customize_button,
+                "Reset text and grid settings to defaults",
+            ),
+            HoverToolTip(self.zoom_out_button, "Zoom out"),
+            HoverToolTip(self.preview_zoom_label, "Preview zoom level"),
+            HoverToolTip(self.zoom_in_button, "Zoom in"),
+            HoverToolTip(self.zoom_fit_button, "Fit preview to window"),
+        ]
 
         preview_viewport = ctk.CTkFrame(preview_frame, corner_radius=8)
         preview_viewport.grid(row=1, column=0, padx=18, pady=(0, 18), sticky="nsew")
@@ -1007,7 +1143,9 @@ class BingoDesktopApp(ctk.CTk):
         )
         self.preview_v_scroll.grid(row=0, column=1, sticky="ns")
         self.preview_h_scroll = ctk.CTkScrollbar(
-            preview_viewport, orientation="horizontal", command=self.preview_canvas.xview
+            preview_viewport,
+            orientation="horizontal",
+            command=self.preview_canvas.xview,
         )
         self.preview_h_scroll.grid(row=1, column=0, sticky="ew")
         self.preview_canvas.configure(
@@ -1020,39 +1158,31 @@ class BingoDesktopApp(ctk.CTk):
         self.preview_canvas.bind("<Configure>", self._on_preview_canvas_configure)
         self._show_preview_warning("Select a template image to start.")
 
-        self.text_color_var.trace_add("write", lambda *_args: self._refresh_preview())
-        self.font_size_var.trace_add("write", lambda *_args: self._refresh_preview())
-        self.text_offset_x_var.trace_add(
-            "write", lambda *_args: self._refresh_preview()
-        )
-        self.text_offset_y_var.trace_add(
-            "write", lambda *_args: self._refresh_preview()
-        )
-        self.free_icon_size_var.trace_add(
-            "write", lambda *_args: self._refresh_preview()
-        )
-        self.grid_offset_x_var.trace_add(
-            "write", lambda *_args: self._refresh_preview()
-        )
-        self.grid_offset_y_var.trace_add(
-            "write", lambda *_args: self._refresh_preview()
-        )
-        self.manual_cell_width_var.trace_add(
-            "write", lambda *_args: self._refresh_preview()
-        )
-        self.manual_cell_height_var.trace_add(
-            "write", lambda *_args: self._refresh_preview()
-        )
-        self.show_grid_overlay_var.trace_add(
-            "write", lambda *_args: self._refresh_preview()
-        )
+        preview_refresh = lambda *_args: self._schedule_preview_refresh()
+        self.text_color_var.trace_add("write", preview_refresh)
+        self.font_size_var.trace_add("write", preview_refresh)
+        self.text_offset_x_var.trace_add("write", preview_refresh)
+        self.text_offset_y_var.trace_add("write", preview_refresh)
+        self.free_icon_size_var.trace_add("write", preview_refresh)
+        self.grid_x_var.trace_add("write", preview_refresh)
+        self.grid_y_var.trace_add("write", preview_refresh)
+        self.grid_cell_width_var.trace_add("write", preview_refresh)
+        self.grid_cell_height_var.trace_add("write", preview_refresh)
+        self.show_grid_overlay_var.trace_add("write", preview_refresh)
+
+        self.bind_all("<Control-z>", self._on_customize_undo_shortcut)
+        self.bind_all("<Control-Z>", self._on_customize_undo_shortcut)
+        self.bind_all("<Control-y>", self._on_customize_redo_shortcut)
+        self.bind_all("<Control-Y>", self._on_customize_redo_shortcut)
+        self.bind_all("<Control-Shift-z>", self._on_customize_redo_shortcut)
+        self.bind_all("<Control-Shift-Z>", self._on_customize_redo_shortcut)
 
     def _toggle_text_settings(self):
         self.text_settings_expanded = not self.text_settings_expanded
         if self.text_settings_expanded:
             self.text_settings_toggle_button.configure(text="▼ Text Settings")
             self.text_settings_frame.grid(
-                row=10, column=0, padx=16, pady=(0, 12), sticky="ew"
+                row=9, column=0, padx=16, pady=(0, 12), sticky="ew"
             )
         else:
             self.text_settings_toggle_button.configure(text="▶ Text Settings")
@@ -1064,7 +1194,7 @@ class BingoDesktopApp(ctk.CTk):
         if self.grid_settings_expanded:
             self.grid_settings_toggle_button.configure(text="▼ Grid Settings")
             self.grid_settings_frame.grid(
-                row=12, column=0, padx=16, pady=(0, 12), sticky="ew"
+                row=11, column=0, padx=16, pady=(0, 12), sticky="ew"
             )
         else:
             self.grid_settings_toggle_button.configure(text="▶ Grid Settings")
@@ -1101,17 +1231,30 @@ class BingoDesktopApp(ctk.CTk):
                 "action": None,
             },
             {
-                "title": "Step 2: Import your cards PDF",
+                "title": "Step 2: Import from Spotify playlist",
                 "body": (
-                    "Click 'Import Cards PDF'. This imports your bingo cards and loads all song values "
-                    "from the PDF. "
+                    "Click 'Import from Spotify Playlist'. This generates your bingo cards PDF automatically "
+                    "and imports song values from it. "
                     "After import, the music-name editor becomes available."
                 ),
-                "target": lambda: self.import_pdf_button,
+                "target": lambda: self.spotify_import_button,
                 "action": None,
             },
             {
-                "title": "Step 3: Edit music names",
+                "title": "Step 3: Import dialog walkthrough",
+                "body": (
+                    "The import dialog is now open. Paste your Spotify playlist URL, choose card setup, "
+                    "then click 'Generate and Import PDF'."
+                ),
+                "target": lambda: self._tutorial_import_dialog
+                or self.spotify_import_button,
+                "action": self._open_tutorial_import_dialog,
+                "keep_import_dialog_open": True,
+                "tooltip_placement": "below",
+                "highlight_target": False,
+            },
+            {
+                "title": "Step 4: Edit music names",
                 "body": (
                     "Use 'Edit Music Names' to fix OCR inconsistencies or rename entries. "
                     "These overrides are saved and used in preview and final generated cards."
@@ -1120,7 +1263,20 @@ class BingoDesktopApp(ctk.CTk):
                 "action": None,
             },
             {
-                "title": "Step 4: Adjust text settings",
+                "title": "Step 5: Music editor dialog walkthrough",
+                "body": (
+                    "The music editor is now open. Each row shows the original song on the left "
+                    "and your editable name on the right. Use Apply to save changes or Reset to undo."
+                ),
+                "target": lambda: self._tutorial_music_editor_dialog
+                or self.edit_music_button,
+                "action": self._open_tutorial_music_editor_dialog,
+                "keep_music_editor_dialog_open": True,
+                "tooltip_placement": "below",
+                "highlight_target": False,
+            },
+            {
+                "title": "Step 6: Adjust text settings",
                 "body": (
                     "Open 'Text Settings' to control text color, font size, offsets, and FREE icon size. "
                     "All changes are visible immediately in Live Preview."
@@ -1129,7 +1285,7 @@ class BingoDesktopApp(ctk.CTk):
                 "action": self._expand_text_settings,
             },
             {
-                "title": "Step 5: Align the grid if needed",
+                "title": "Step 7: Align the grid if needed",
                 "body": (
                     "Open 'Grid Settings' only if text placement needs correction. "
                     "Use grid offsets and cell width/height adjust to align content to your template."
@@ -1138,7 +1294,7 @@ class BingoDesktopApp(ctk.CTk):
                 "action": self._expand_grid_settings,
             },
             {
-                "title": "Step 6: Choose output and generate",
+                "title": "Step 8: Choose output and generate",
                 "body": (
                     "Choose an output folder using the Output button. "
                     "This is where generated bingo cards will be saved."
@@ -1147,7 +1303,7 @@ class BingoDesktopApp(ctk.CTk):
                 "action": None,
             },
             {
-                "title": "Step 7: Generate cards",
+                "title": "Step 9: Generate cards",
                 "body": (
                     "Press 'Generate Cards' to create your final PNG bingo cards. "
                     "When complete, use 'Open Generated Folder' to review exports."
@@ -1173,7 +1329,9 @@ class BingoDesktopApp(ctk.CTk):
             anchor="w",
             justify="left",
         )
-        self._tutorial_title_label.grid(row=0, column=0, padx=14, pady=(12, 6), sticky="ew")
+        self._tutorial_title_label.grid(
+            row=0, column=0, padx=14, pady=(12, 6), sticky="ew"
+        )
         self._tutorial_body_label = ctk.CTkLabel(
             tooltip,
             text="",
@@ -1181,7 +1339,9 @@ class BingoDesktopApp(ctk.CTk):
             justify="left",
             wraplength=390,
         )
-        self._tutorial_body_label.grid(row=1, column=0, padx=14, pady=(0, 8), sticky="nsew")
+        self._tutorial_body_label.grid(
+            row=1, column=0, padx=14, pady=(0, 8), sticky="nsew"
+        )
 
         footer = ctk.CTkFrame(tooltip, fg_color="transparent")
         footer.grid(row=2, column=0, padx=14, pady=(2, 12), sticky="ew")
@@ -1215,6 +1375,32 @@ class BingoDesktopApp(ctk.CTk):
         if not self.grid_settings_expanded:
             self._toggle_grid_settings()
 
+    def _open_tutorial_import_dialog(self):
+        self._open_spotify_import_dialog(tutorial_mode=True)
+
+    def _close_tutorial_import_dialog(self):
+        if self._tutorial_import_dialog and self._tutorial_import_dialog.winfo_exists():
+            self._tutorial_import_dialog.destroy()
+        self._tutorial_import_dialog = None
+
+    def _open_tutorial_music_editor_dialog(self):
+        self._open_music_name_editor(tutorial_mode=True)
+
+    def _close_tutorial_music_editor_dialog(self):
+        if (
+            self._tutorial_music_editor_dialog
+            and self._tutorial_music_editor_dialog.winfo_exists()
+        ):
+            self._tutorial_music_editor_dialog.destroy()
+        self._tutorial_music_editor_dialog = None
+
+    def _tutorial_music_editor_sample_names(self) -> list[str]:
+        return [
+            "Example Song One",
+            "Example Song Two",
+            "Example Song Three",
+        ]
+
     def _render_tutorial_step(self):
         if not self._tutorial_steps:
             return
@@ -1222,19 +1408,28 @@ class BingoDesktopApp(ctk.CTk):
             0, min(self._tutorial_step_index, len(self._tutorial_steps) - 1)
         )
         current = self._tutorial_steps[self._tutorial_step_index]
+        if not current.get("keep_import_dialog_open"):
+            self._close_tutorial_import_dialog()
+        if not current.get("keep_music_editor_dialog_open"):
+            self._close_tutorial_music_editor_dialog()
         action = current.get("action")
         if callable(action):
             action()
         target_getter = current.get("target")
         target_widget = target_getter() if callable(target_getter) else None
         self._tutorial_ensure_widget_visible(target_widget)
-        self._tutorial_highlight_widget(target_widget)
+        if current.get("highlight_target", True):
+            self._tutorial_highlight_widget(target_widget)
+        else:
+            self._clear_tutorial_highlight()
         self._tutorial_title_label.configure(text=current["title"])
         self._tutorial_body_label.configure(text=current["body"])
         self._tutorial_progress_label.configure(
             text=f"Step {self._tutorial_step_index + 1} of {len(self._tutorial_steps)}"
         )
         self._tutorial_position_tooltip()
+        if current.get("tooltip_placement") == "below":
+            self.after(80, self._tutorial_position_tooltip)
 
         if self._tutorial_step_index >= len(self._tutorial_steps) - 1:
             self._tutorial_next_button.configure(text="Finish")
@@ -1247,10 +1442,20 @@ class BingoDesktopApp(ctk.CTk):
     def _tutorial_position_tooltip(self):
         if not (self._tutorial_tooltip and self._tutorial_tooltip.winfo_exists()):
             return
-        self.update_idletasks()
-        target = self._tutorial_target_widget
+        if not self._tutorial_steps:
+            return
+        current = self._tutorial_steps[
+            max(0, min(self._tutorial_step_index, len(self._tutorial_steps) - 1))
+        ]
+        placement = current.get("tooltip_placement", "beside")
+        target_getter = current.get("target")
+        target = (
+            target_getter() if callable(target_getter) else self._tutorial_target_widget
+        )
         if not target or not target.winfo_exists():
             return
+        self.update_idletasks()
+        target.update_idletasks()
         self._tutorial_tooltip.update_idletasks()
         work_area = get_windows_work_area()
         if work_area:
@@ -1264,25 +1469,62 @@ class BingoDesktopApp(ctk.CTk):
             screen_h = self.winfo_vrootheight()
         target_x = target.winfo_rootx()
         target_y = target.winfo_rooty()
-        target_w = target.winfo_width()
-        target_h = target.winfo_height()
+        target_w = max(target.winfo_width(), target.winfo_reqwidth())
+        target_h = max(target.winfo_height(), target.winfo_reqheight())
         tip_w = self._tutorial_tooltip.winfo_width()
         tip_h = self._tutorial_tooltip.winfo_height()
         gap = 14
         margin = 12
 
-        x = target_x + target_w + gap
-        y = target_y
-        if x + tip_w > (screen_x + screen_w - margin):
-            x = target_x - tip_w - gap
-        if y + tip_h > (screen_y + screen_h - margin):
-            y = target_y + target_h - tip_h
+        if placement == "below":
+            x = target_x + max(0, (target_w - tip_w) // 2)
+            y = target_y + target_h + gap
+            if y + tip_h > (screen_y + screen_h - margin):
+                y = target_y - tip_h - gap
+        else:
+            x = target_x + target_w + gap
+            y = target_y
+            if x + tip_w > (screen_x + screen_w - margin):
+                x = target_x - tip_w - gap
+            if y + tip_h > (screen_y + screen_h - margin):
+                y = target_y + target_h - tip_h
 
         max_x = (screen_x + screen_w) - tip_w - margin
         max_y = (screen_y + screen_h) - tip_h - margin
         x = max(screen_x + margin, min(x, max_x))
         y = max(screen_y + margin, min(y, max_y))
+
+        if self._tutorial_overlaps_target(
+            x, y, tip_w, tip_h, target_x, target_y, target_w, target_h
+        ):
+            x = target_x + max(0, (target_w - tip_w) // 2)
+            y = target_y + target_h + gap
+            x = max(screen_x + margin, min(x, max_x))
+            y = max(screen_y + margin, min(y, max_y))
+
         self._tutorial_tooltip.geometry(f"+{x}+{y}")
+
+    @staticmethod
+    def _tutorial_overlaps_target(
+        tip_x: int,
+        tip_y: int,
+        tip_w: int,
+        tip_h: int,
+        target_x: int,
+        target_y: int,
+        target_w: int,
+        target_h: int,
+    ) -> bool:
+        tip_right = tip_x + tip_w
+        tip_bottom = tip_y + tip_h
+        target_right = target_x + target_w
+        target_bottom = target_y + target_h
+        return not (
+            tip_right <= target_x
+            or tip_x >= target_right
+            or tip_bottom <= target_y
+            or tip_y >= target_bottom
+        )
 
     def _tutorial_ensure_widget_visible(self, widget):
         if widget is None or not widget.winfo_exists():
@@ -1300,7 +1542,10 @@ class BingoDesktopApp(ctk.CTk):
         widget_top = widget.winfo_rooty()
         widget_bottom = widget_top + widget.winfo_height()
         margin = 18
-        if widget_top >= canvas_top + margin and widget_bottom <= canvas_bottom - margin:
+        if (
+            widget_top >= canvas_top + margin
+            and widget_bottom <= canvas_bottom - margin
+        ):
             return
 
         try:
@@ -1353,8 +1598,12 @@ class BingoDesktopApp(ctk.CTk):
                     )
                 elif "highlightthickness" in self._tutorial_target_restore:
                     self._tutorial_target_widget.configure(
-                        highlightthickness=self._tutorial_target_restore["highlightthickness"],
-                        highlightbackground=self._tutorial_target_restore["highlightbackground"],
+                        highlightthickness=self._tutorial_target_restore[
+                            "highlightthickness"
+                        ],
+                        highlightbackground=self._tutorial_target_restore[
+                            "highlightbackground"
+                        ],
                     )
             except Exception:
                 pass
@@ -1378,12 +1627,17 @@ class BingoDesktopApp(ctk.CTk):
         if mark_seen:
             self.tutorial_seen = True
             self._save_state()
+        self._close_tutorial_import_dialog()
+        self._close_tutorial_music_editor_dialog()
         self._clear_tutorial_highlight()
         if self._tutorial_tooltip and self._tutorial_tooltip.winfo_exists():
             self._tutorial_tooltip.destroy()
         self._tutorial_tooltip = None
 
-    def _step_int_var(self, variable: tk.IntVar, delta: int, minimum: int, maximum: int):
+    def _step_int_var(
+        self, variable: tk.IntVar, delta: int, minimum: int, maximum: int
+    ):
+        self._stash_customize_undo(f"step:{id(variable)}")
         current = int(variable.get())
         variable.set(max(minimum, min(maximum, current + delta)))
 
@@ -1415,8 +1669,39 @@ class BingoDesktopApp(ctk.CTk):
             width=button_width,
             command=lambda: self._step_int_var(variable, -1, minimum, maximum),
         ).grid(row=0, column=0, padx=(0, 6))
-        value_label = ctk.CTkLabel(controls, text=str(int(variable.get())), width=value_width)
-        value_label.grid(row=0, column=1, padx=(0, 6))
+        entry_var = tk.StringVar(value=str(int(variable.get())))
+
+        def sync_entry_from_var(*_args):
+            entry_var.set(str(int(variable.get())))
+
+        def commit_int_entry(_event=None):
+            raw_value = entry_var.get().strip()
+            try:
+                parsed = int(raw_value)
+            except ValueError:
+                parsed = int(variable.get())
+            parsed = max(minimum, min(maximum, parsed))
+            if parsed != int(variable.get()):
+                self._stash_customize_undo(f"entry:{id(variable)}")
+            variable.set(parsed)
+            entry_var.set(str(parsed))
+            self._save_state()
+
+        variable.trace_add("write", sync_entry_from_var)
+        entry_action_key = f"entry:{id(variable)}"
+        value_entry = ctk.CTkEntry(
+            controls,
+            textvariable=entry_var,
+            width=value_width,
+            justify="center",
+        )
+        value_entry.grid(row=0, column=1, padx=(0, 6))
+        value_entry.bind(
+            "<FocusIn>",
+            lambda _event, key=entry_action_key: self._stash_customize_undo(key),
+        )
+        value_entry.bind("<Return>", commit_int_entry)
+        value_entry.bind("<FocusOut>", commit_int_entry)
         ctk.CTkButton(
             controls,
             text="+",
@@ -1424,11 +1709,12 @@ class BingoDesktopApp(ctk.CTk):
             command=lambda: self._step_int_var(variable, 1, minimum, maximum),
         ).grid(row=0, column=2)
 
-        return value_label
+        return value_entry
 
     def _step_float_var(
         self, variable: tk.DoubleVar, delta: float, minimum: float, maximum: float
     ):
+        self._stash_customize_undo(f"step:{id(variable)}")
         current = float(variable.get())
         new_value = max(minimum, min(maximum, current + delta))
         variable.set(round(new_value, 2))
@@ -1463,10 +1749,40 @@ class BingoDesktopApp(ctk.CTk):
             width=button_width,
             command=lambda: self._step_float_var(variable, -step, minimum, maximum),
         ).grid(row=0, column=0, padx=(0, 6))
-        value_label = ctk.CTkLabel(
-            controls, text=f"{float(variable.get()):.{decimals}f}", width=value_width
+        entry_var = tk.StringVar(value=f"{float(variable.get()):.{decimals}f}")
+
+        def sync_entry_from_var(*_args):
+            entry_var.set(f"{float(variable.get()):.{decimals}f}")
+
+        def commit_float_entry(_event=None):
+            raw_value = entry_var.get().strip()
+            try:
+                parsed = float(raw_value)
+            except ValueError:
+                parsed = float(variable.get())
+            parsed = max(minimum, min(maximum, parsed))
+            rounded = round(parsed, decimals)
+            if rounded != round(float(variable.get()), decimals):
+                self._stash_customize_undo(f"entry:{id(variable)}")
+            variable.set(rounded)
+            entry_var.set(f"{float(variable.get()):.{decimals}f}")
+            self._save_state()
+
+        variable.trace_add("write", sync_entry_from_var)
+        entry_action_key = f"entry:{id(variable)}"
+        value_entry = ctk.CTkEntry(
+            controls,
+            textvariable=entry_var,
+            width=value_width,
+            justify="center",
         )
-        value_label.grid(row=0, column=1, padx=(0, 6))
+        value_entry.grid(row=0, column=1, padx=(0, 6))
+        value_entry.bind(
+            "<FocusIn>",
+            lambda _event, key=entry_action_key: self._stash_customize_undo(key),
+        )
+        value_entry.bind("<Return>", commit_float_entry)
+        value_entry.bind("<FocusOut>", commit_float_entry)
         ctk.CTkButton(
             controls,
             text="+",
@@ -1474,7 +1790,7 @@ class BingoDesktopApp(ctk.CTk):
             command=lambda: self._step_float_var(variable, step, minimum, maximum),
         ).grid(row=0, column=2)
 
-        return value_label
+        return value_entry
 
     def _select_template(self):
         file_path = filedialog.askopenfilename(
@@ -1495,14 +1811,363 @@ class BingoDesktopApp(ctk.CTk):
         )
         if not file_path:
             return
+        self.playlist_tracks = []
+        self.playlist_include_artist = False
         self._load_pdf_file(Path(file_path), show_error=True)
 
+    def _is_valid_spotify_playlist_url(self, value: str) -> bool:
+        try:
+            parsed = urlparse(value.strip())
+        except Exception:
+            return False
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        if "spotify.com" not in parsed.netloc.lower():
+            return False
+        return "/playlist/" in parsed.path.lower()
+
+    def _open_spotify_import_dialog(self, tutorial_mode: bool = False):
+        if (
+            tutorial_mode
+            and self._tutorial_import_dialog
+            and self._tutorial_import_dialog.winfo_exists()
+        ):
+            self._tutorial_import_dialog.lift()
+            self._tutorial_import_dialog.focus_force()
+            return
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Import from Spotify Playlist")
+        dialog.geometry("760x500")
+        dialog.minsize(700, 470)
+        dialog.transient(self)
+        if not tutorial_mode:
+            dialog.grab_set()
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(1, weight=1)
+        if tutorial_mode:
+            self._tutorial_import_dialog = dialog
+
+            def _clear_tutorial_dialog_ref(_event=None):
+                if self._tutorial_import_dialog is dialog:
+                    self._tutorial_import_dialog = None
+
+            dialog.bind("<Destroy>", _clear_tutorial_dialog_ref, add="+")
+
+        ctk.CTkLabel(
+            dialog,
+            text="Generate a bingo PDF from musicbingogenerator.com",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            anchor="w",
+        ).grid(row=0, column=0, padx=18, pady=(18, 8), sticky="ew")
+
+        content = ctk.CTkFrame(dialog)
+        content.grid(row=1, column=0, padx=18, pady=(0, 12), sticky="nsew")
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_rowconfigure(1, weight=1)
+
+        # Top: playlist input section
+        source_frame = ctk.CTkFrame(content)
+        source_frame.grid(row=0, column=0, padx=14, pady=(14, 10), sticky="ew")
+        source_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            source_frame,
+            text="Spotify Playlist URL",
+            anchor="w",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).grid(row=0, column=0, padx=12, pady=(10, 6), sticky="w")
+        spotify_url_entry = ctk.CTkEntry(
+            source_frame,
+            textvariable=self.spotify_playlist_url_var,
+            placeholder_text="https://open.spotify.com/playlist/...",
+        )
+        spotify_url_entry.grid(row=1, column=0, padx=12, pady=(0, 6), sticky="ew")
+        spotify_url_entry.bind("<FocusOut>", lambda _event: self._save_state())
+        ctk.CTkLabel(
+            source_frame,
+            text="Public Spotify playlists are supported.",
+            text_color="#9ca3af",
+            anchor="w",
+        ).grid(row=2, column=0, padx=12, pady=(0, 10), sticky="w")
+
+        # Middle: options and status in two columns
+        options_frame = ctk.CTkFrame(content)
+        options_frame.grid(row=1, column=0, padx=14, pady=(0, 10), sticky="nsew")
+        options_frame.grid_columnconfigure(0, weight=1, uniform="spotifycols")
+        options_frame.grid_columnconfigure(1, weight=1, uniform="spotifycols")
+        options_frame.grid_rowconfigure(0, weight=1)
+
+        left_col = ctk.CTkFrame(options_frame)
+        left_col.grid(row=0, column=0, padx=(12, 6), pady=12, sticky="nsew")
+        left_col.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            left_col,
+            text="Card Setup",
+            anchor="w",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).grid(row=0, column=0, padx=12, pady=(10, 8), sticky="w")
+
+        ctk.CTkLabel(left_col, text="Grid Size", anchor="w").grid(
+            row=1, column=0, padx=12, pady=(0, 4), sticky="w"
+        )
+        ctk.CTkOptionMenu(
+            left_col,
+            values=["3x3", "4x4", "5x5", "6x6"],
+            variable=self.spotify_grid_size_var,
+            width=140,
+            command=lambda _value: self._save_state(),
+        ).grid(row=2, column=0, padx=12, pady=(0, 10), sticky="w")
+
+        ctk.CTkLabel(left_col, text="Number of Cards", anchor="w").grid(
+            row=3, column=0, padx=12, pady=(0, 4), sticky="w"
+        )
+        cards_controls = ctk.CTkFrame(left_col, fg_color="transparent")
+        cards_controls.grid(row=4, column=0, padx=12, pady=(0, 4), sticky="w")
+        card_count_entry_var = tk.StringVar(
+            value=str(int(self.spotify_card_count_var.get()))
+        )
+
+        def sync_card_count_entry(*_args):
+            card_count_entry_var.set(str(int(self.spotify_card_count_var.get())))
+
+        def commit_card_count(_event=None):
+            raw_value = card_count_entry_var.get().strip()
+            try:
+                parsed = int(raw_value)
+            except ValueError:
+                parsed = int(self.spotify_card_count_var.get())
+            parsed = max(1, min(200, parsed))
+            self.spotify_card_count_var.set(parsed)
+            card_count_entry_var.set(str(parsed))
+            self._save_state()
+
+        def step_spotify_cards(delta: int):
+            self._step_int_var(self.spotify_card_count_var, delta, 1, 200)
+
+        ctk.CTkButton(
+            cards_controls,
+            text="-",
+            width=32,
+            command=lambda: step_spotify_cards(-1),
+        ).grid(row=0, column=0, padx=(0, 6))
+        self.spotify_card_count_var.trace_add("write", sync_card_count_entry)
+        spotify_card_count_entry = ctk.CTkEntry(
+            cards_controls,
+            textvariable=card_count_entry_var,
+            width=60,
+            justify="center",
+        )
+        spotify_card_count_entry.grid(row=0, column=1, padx=(0, 6))
+        spotify_card_count_entry.bind("<Return>", commit_card_count)
+        spotify_card_count_entry.bind("<FocusOut>", commit_card_count)
+        ctk.CTkButton(
+            cards_controls,
+            text="+",
+            width=32,
+            command=lambda: step_spotify_cards(1),
+        ).grid(row=0, column=2)
+
+        right_col = ctk.CTkFrame(options_frame)
+        right_col.grid(row=0, column=1, padx=(6, 12), pady=12, sticky="nsew")
+        right_col.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            right_col,
+            text="Options",
+            anchor="w",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).grid(row=0, column=0, padx=12, pady=(10, 8), sticky="w")
+
+        include_artist_switch = ctk.CTkSwitch(
+            right_col,
+            text="Include artist name",
+            variable=self.spotify_include_artist_var,
+            command=self._save_state,
+        )
+        include_artist_switch.grid(row=1, column=0, padx=12, pady=(0, 8), sticky="w")
+        free_center_switch = ctk.CTkSwitch(
+            right_col,
+            text="Free center space (odd grids only)",
+            variable=self.spotify_free_center_var,
+            command=self._save_state,
+        )
+        free_center_switch.grid(row=2, column=0, padx=12, pady=(0, 10), sticky="w")
+
+        spotify_status_label = ctk.CTkLabel(
+            right_col, text="Status: idle", text_color="#9ca3af", anchor="w"
+        )
+        spotify_status_label.grid(row=3, column=0, padx=12, pady=(6, 10), sticky="ew")
+
+        actions = ctk.CTkFrame(dialog, fg_color="transparent")
+        actions.grid(row=2, column=0, padx=18, pady=(0, 18), sticky="ew")
+        actions.grid_columnconfigure(0, weight=1, uniform="action")
+        actions.grid_columnconfigure(1, weight=1, uniform="action")
+
+        ctk.CTkButton(
+            actions,
+            text="Close",
+            command=dialog.destroy,
+            fg_color="#374151",
+            hover_color="#4b5563",
+        ).grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        generate_button = ctk.CTkButton(
+            actions,
+            text="Generate and Import PDF",
+            fg_color="#16a34a",
+            hover_color="#15803d",
+            command=lambda: (
+                commit_card_count(),
+                self._start_spotify_pdf_generation(
+                    dialog=dialog,
+                    status_label=spotify_status_label,
+                    generate_button=generate_button,
+                ),
+            ),
+        )
+        generate_button.grid(row=0, column=1, sticky="ew")
+
+    def _start_spotify_pdf_generation(self, dialog, status_label, generate_button):
+        playlist_url = self.spotify_playlist_url_var.get().strip()
+        if not self._is_valid_spotify_playlist_url(playlist_url):
+            messagebox.showwarning(
+                "Invalid Playlist URL",
+                "Please provide a valid Spotify playlist URL.",
+            )
+            return
+        grid_size_text = self.spotify_grid_size_var.get().strip().lower()
+        try:
+            grid_size = int(grid_size_text.split("x")[0])
+        except Exception:
+            messagebox.showwarning(
+                "Invalid Grid Size", "Please choose a valid grid size."
+            )
+            return
+        number_of_cards = int(self.spotify_card_count_var.get())
+        if number_of_cards < 1:
+            messagebox.showwarning(
+                "Invalid Card Count", "Number of cards must be at least 1."
+            )
+            return
+
+        options = PlaylistGenerationOptions(
+            playlist_url=playlist_url,
+            grid_size=grid_size,
+            number_of_cards=number_of_cards,
+            include_artist_name=bool(self.spotify_include_artist_var.get()),
+            free_center_space=bool(self.spotify_free_center_var.get()),
+        )
+        temp_pdf_dir = SPOTIFY_TEMP_PDF_DIR
+
+        generate_button.configure(state="disabled")
+        status_label.configure(text="Status: generating PDF from playlist...")
+
+        def worker():
+            try:
+                result = generate_playlist_pdf(
+                    options=options, output_dir=temp_pdf_dir
+                )
+                self.after(
+                    0,
+                    lambda result=result: self._on_spotify_pdf_success(
+                        dialog=dialog,
+                        status_label=status_label,
+                        generate_button=generate_button,
+                        result=result,
+                    ),
+                )
+            except Exception as error:
+                self.after(
+                    0,
+                    lambda error=error: self._on_spotify_pdf_failure(
+                        status_label=status_label,
+                        generate_button=generate_button,
+                        error=error,
+                    ),
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_spotify_pdf_success(
+        self, dialog, status_label, generate_button, result: PlaylistPdfResult
+    ):
+        pdf_path = result.pdf_path
+        self.spotify_downloaded_pdf_path = pdf_path
+        self.playlist_tracks = list(result.tracks)
+        self.playlist_include_artist = bool(result.include_artist_name)
+        status_label.configure(text=f"Status: downloaded {pdf_path.name}")
+        generate_button.configure(state="normal")
+        dialog.destroy()
+        loaded = self._load_pdf_file(pdf_path, show_error=True, reset_grid=True)
+        if loaded:
+            self._save_state()
+            messagebox.showinfo("Spotify Import Complete", f"Imported PDF:\n{pdf_path}")
+
+    def _on_spotify_pdf_failure(self, status_label, generate_button, error: Exception):
+        status_label.configure(text="Status: failed")
+        generate_button.configure(state="normal")
+        if isinstance(error, PlaylistGenerationError):
+            messagebox.showerror("Spotify Import Error", str(error))
+            return
+        messagebox.showerror(
+            "Spotify Import Error", f"Could not generate PDF:\n{error}"
+        )
+
     def _effective_grid_size(self) -> int:
-        if self.pdf_layout:
+        if self.pdf_layout in SUPPORTED_GRID_SIZES:
             return self.pdf_layout
-        if self.template_layout:
-            return self.template_layout
         return 5
+
+    def _default_grid_cells(self, grid_size: int) -> list[dict]:
+        if self.template_image is None:
+            return []
+        width, height = self.template_image.size
+        return build_default_grid_cells(width, height, grid_size)
+
+    def _default_grid_origin(self, grid_size: int) -> tuple[int, int]:
+        cells = self._default_grid_cells(grid_size)
+        if not cells:
+            return (0, 0)
+        return min(cell["x1"] for cell in cells), min(cell["y1"] for cell in cells)
+
+    def _default_grid_cell_size(self, grid_size: int) -> tuple[int, int]:
+        cells = self._default_grid_cells(grid_size)
+        if not cells:
+            return (120, 120)
+        widths = [cell["width"] for cell in cells]
+        heights = [cell["height"] for cell in cells]
+        return (
+            int(round(float(np.median(widths)))),
+            int(round(float(np.median(heights)))),
+        )
+
+    def _reset_grid_placement(self) -> None:
+        grid_size = self._effective_grid_size()
+        default_x, default_y = self._default_grid_origin(grid_size)
+        default_w, default_h = self._default_grid_cell_size(grid_size)
+        self.grid_x_var.set(default_x)
+        self.grid_y_var.set(default_y)
+        self.grid_cell_width_var.set(default_w)
+        self.grid_cell_height_var.set(default_h)
+
+    def _apply_legacy_grid_offsets(self, offset_x: int, offset_y: int) -> None:
+        grid_size = self._effective_grid_size()
+        default_x, default_y = self._default_grid_origin(grid_size)
+        self.grid_x_var.set(default_x + offset_x)
+        self.grid_y_var.set(default_y + offset_y)
+
+    def _apply_legacy_cell_adjustments(self, width_adjust: int, height_adjust: int) -> None:
+        grid_size = self._effective_grid_size()
+        default_w, default_h = self._default_grid_cell_size(grid_size)
+        self.grid_cell_width_var.set(max(20, default_w + width_adjust))
+        self.grid_cell_height_var.set(max(20, default_h + height_adjust))
+
+    def _update_pdf_layout_label(self) -> None:
+        if self.pdf_layout in SUPPORTED_GRID_SIZES:
+            self.pdf_layout_label.configure(
+                text=f"Grid layout: {self.pdf_layout}x{self.pdf_layout} (from PDF)"
+            )
+        else:
+            self.pdf_layout_label.configure(text="Grid layout: -")
 
     def _format_output_button_text(self) -> str:
         if self.output_dir is None:
@@ -1532,6 +2197,133 @@ class BingoDesktopApp(ctk.CTk):
             name = f"{name[:10]}...{name[-10:]}"
         return f"{label_prefix} {name}"
 
+    def _capture_customize_snapshot(self) -> dict:
+        return {
+            "text_color": self._normalize_color(self.text_color_var.get()),
+            "font_size": int(self.font_size_var.get()),
+            "text_offset_x": int(self.text_offset_x_var.get()),
+            "text_offset_y": int(self.text_offset_y_var.get()),
+            "free_icon_size": round(float(self.free_icon_size_var.get()), 2),
+            "free_icon_path": str(self.free_icon_path) if self.free_icon_path else None,
+            "grid_x": int(self.grid_x_var.get()),
+            "grid_y": int(self.grid_y_var.get()),
+            "grid_cell_width": int(self.grid_cell_width_var.get()),
+            "grid_cell_height": int(self.grid_cell_height_var.get()),
+            "show_grid_overlay": bool(self.show_grid_overlay_var.get()),
+        }
+
+    def _apply_customize_snapshot(self, snapshot: dict) -> None:
+        self._customize_history_suppressed = True
+        try:
+            self.text_color_var.set(snapshot.get("text_color", "#000000"))
+            self.font_size_var.set(int(snapshot.get("font_size", 26)))
+            self.text_offset_x_var.set(int(snapshot.get("text_offset_x", 0)))
+            self.text_offset_y_var.set(int(snapshot.get("text_offset_y", 0)))
+            self.free_icon_size_var.set(
+                float(snapshot.get("free_icon_size", FREE_ICON_SIZE_DEFAULT))
+            )
+            free_icon_path = snapshot.get("free_icon_path")
+            if free_icon_path and Path(free_icon_path).exists():
+                self.free_icon_path = Path(free_icon_path)
+            else:
+                self.free_icon_path = None
+            self.free_icon_path_label.configure(text=self._format_free_icon_label())
+            if "grid_x" in snapshot or "grid_y" in snapshot:
+                self.grid_x_var.set(int(snapshot.get("grid_x", 0)))
+                self.grid_y_var.set(int(snapshot.get("grid_y", 0)))
+            else:
+                self._apply_legacy_grid_offsets(
+                    int(snapshot.get("grid_offset_x", 0)),
+                    int(snapshot.get("grid_offset_y", 0)),
+                )
+            if "grid_cell_width" in snapshot or "grid_cell_height" in snapshot:
+                self.grid_cell_width_var.set(
+                    int(snapshot.get("grid_cell_width", 120))
+                )
+                self.grid_cell_height_var.set(
+                    int(snapshot.get("grid_cell_height", 120))
+                )
+            else:
+                self._apply_legacy_cell_adjustments(
+                    int(snapshot.get("manual_cell_width", 0)),
+                    int(snapshot.get("manual_cell_height", 0)),
+                )
+            self.show_grid_overlay_var.set(
+                bool(snapshot.get("show_grid_overlay", True))
+            )
+        finally:
+            self._customize_history_suppressed = False
+        self._invalidate_free_image_cache()
+        self._schedule_preview_refresh()
+
+    def _clear_customize_action_group(self) -> None:
+        self._customize_active_action_key = None
+
+    def _stash_customize_undo(self, action_key: str | None = None) -> None:
+        if self._customize_history_suppressed or self._loading_state:
+            return
+
+        if action_key is not None and action_key == self._customize_active_action_key:
+            return
+
+        snapshot = self._capture_customize_snapshot()
+        if self._customize_undo_stack and self._customize_undo_stack[-1] == snapshot:
+            self._customize_active_action_key = action_key
+            return
+
+        self._customize_undo_stack.append(snapshot)
+        if len(self._customize_undo_stack) > CUSTOMIZE_UNDO_LIMIT:
+            self._customize_undo_stack.pop(0)
+        self._customize_redo_stack.clear()
+        self._customize_active_action_key = action_key
+        self._update_customize_undo_redo_buttons()
+
+    def _update_customize_undo_redo_buttons(self) -> None:
+        undo_state = "normal" if self._customize_undo_stack else "disabled"
+        redo_state = "normal" if self._customize_redo_stack else "disabled"
+        self.undo_customize_button.configure(state=undo_state)
+        self.redo_customize_button.configure(state=redo_state)
+
+    def _undo_customize(self) -> None:
+        if not self._customize_undo_stack:
+            return
+        self._clear_customize_action_group()
+        current = self._capture_customize_snapshot()
+        previous = self._customize_undo_stack.pop()
+        if previous != current:
+            self._customize_redo_stack.append(current)
+            if len(self._customize_redo_stack) > CUSTOMIZE_UNDO_LIMIT:
+                self._customize_redo_stack.pop(0)
+        self._apply_customize_snapshot(previous)
+        self._update_customize_undo_redo_buttons()
+        self._schedule_save_state()
+
+    def _redo_customize(self) -> None:
+        if not self._customize_redo_stack:
+            return
+        self._clear_customize_action_group()
+        current = self._capture_customize_snapshot()
+        next_snapshot = self._customize_redo_stack.pop()
+        if next_snapshot != current:
+            self._customize_undo_stack.append(current)
+            if len(self._customize_undo_stack) > CUSTOMIZE_UNDO_LIMIT:
+                self._customize_undo_stack.pop(0)
+        self._apply_customize_snapshot(next_snapshot)
+        self._update_customize_undo_redo_buttons()
+        self._schedule_save_state()
+
+    def _on_grid_overlay_toggled(self) -> None:
+        self._stash_customize_undo("toggle:grid_overlay")
+        self._schedule_preview_refresh()
+
+    def _on_customize_undo_shortcut(self, _event=None):
+        self._undo_customize()
+        return "break"
+
+    def _on_customize_redo_shortcut(self, _event=None):
+        self._redo_customize()
+        return "break"
+
     def _select_free_icon(self):
         file_path = filedialog.askopenfilename(
             title="Select FREE icon image",
@@ -1546,11 +2338,15 @@ class BingoDesktopApp(ctk.CTk):
         try:
             Image.open(selected).verify()
         except Exception:
-            messagebox.showerror("Invalid Image", "Could not read the selected icon image.")
+            messagebox.showerror(
+                "Invalid Image", "Could not read the selected icon image."
+            )
             return
+        self._stash_customize_undo("pick:free_icon")
         self.free_icon_path = selected
         self.free_icon_path_label.configure(text=self._format_free_icon_label())
-        self._refresh_preview()
+        self._invalidate_free_image_cache()
+        self._schedule_preview_refresh()
 
     def _open_output_folder(self):
         if self.output_dir is None:
@@ -1566,6 +2362,7 @@ class BingoDesktopApp(ctk.CTk):
         os.startfile(self.output_dir)
 
     def _reset_configs(self):
+        self._stash_customize_undo("reset:all")
         self.text_color_var.set("#000000")
         self.font_size_var.set(26)
         self.text_offset_x_var.set(0)
@@ -1573,42 +2370,30 @@ class BingoDesktopApp(ctk.CTk):
         self.free_icon_size_var.set(FREE_ICON_SIZE_DEFAULT)
         self.free_icon_path = None
         self.free_icon_path_label.configure(text=self._format_free_icon_label())
-        self.grid_offset_x_var.set(0)
-        self.grid_offset_y_var.set(0)
-        self.manual_cell_width_var.set(0)
-        self.manual_cell_height_var.set(0)
+        self._invalidate_free_image_cache()
+        self._reset_grid_placement()
         self.show_grid_overlay_var.set(True)
         self.generate_progress.set(0)
         self.generate_status_label.configure(text="Generation status: idle")
-        self._refresh_preview()
+        self._schedule_preview_refresh()
 
     def _generate_cards(self):
         if self.template_image is None or self.template_path is None:
-            messagebox.showwarning("Missing Template", "Please select a template image first.")
+            messagebox.showwarning(
+                "Missing Template", "Please select a template image first."
+            )
             return
         if self.pdf_path is None:
-            messagebox.showwarning("Missing PDF", "Please import the cards PDF first.")
+            messagebox.showwarning(
+                "Missing PDF",
+                "Please import from Spotify playlist first.",
+            )
             return
         if self.output_dir is None:
             messagebox.showwarning(
                 "Missing Output Folder", "Please choose an output folder first."
             )
             return
-        if (
-            self.template_layout
-            and self.pdf_layout
-            and self.template_layout != self.pdf_layout
-        ):
-            messagebox.showwarning(
-                "Layout Mismatch",
-                (
-                    f"Template is {self.template_layout}x{self.template_layout} but "
-                    f"PDF is {self.pdf_layout}x{self.pdf_layout}.\n"
-                    "Use matching layouts before generating cards."
-                ),
-            )
-            return
-
         self.generate_button.configure(state="disabled")
         self.generate_progress.set(0)
         self.generate_status_label.configure(text="Generation status: preparing...")
@@ -1617,13 +2402,19 @@ class BingoDesktopApp(ctk.CTk):
         try:
             cards = self._get_cached_valid_cards(force_reload=True)
             if not cards:
-                self.generate_status_label.configure(text="Generation status: no cards found")
-                messagebox.showwarning("No Cards Found", "No cards were extracted from the PDF.")
+                self.generate_status_label.configure(
+                    text="Generation status: no cards found"
+                )
+                messagebox.showwarning(
+                    "No Cards Found", "No cards were extracted from the PDF."
+                )
                 return
 
             total_cards = len(cards)
             if total_cards == 0:
-                self.generate_status_label.configure(text="Generation status: no valid cards")
+                self.generate_status_label.configure(
+                    text="Generation status: no valid cards"
+                )
                 messagebox.showwarning(
                     "No Cards Found", "No cards with song matrices were extracted."
                 )
@@ -1642,12 +2433,13 @@ class BingoDesktopApp(ctk.CTk):
                     text_offset_x=int(self.text_offset_x_var.get()),
                     text_offset_y=int(self.text_offset_y_var.get()),
                     free_icon_size=float(self.free_icon_size_var.get()),
-                    grid_offset_x=int(self.grid_offset_x_var.get()),
-                    grid_offset_y=int(self.grid_offset_y_var.get()),
-                    manual_cell_width=int(self.manual_cell_width_var.get()),
-                    manual_cell_height=int(self.manual_cell_height_var.get()),
+                    grid_x=int(self.grid_x_var.get()),
+                    grid_y=int(self.grid_y_var.get()),
+                    cell_width=int(self.grid_cell_width_var.get()),
+                    cell_height=int(self.grid_cell_height_var.get()),
                     show_grid_overlay=False,
                     free_image_path=self.free_icon_path,
+                    free_image=self._get_free_image_rgba(),
                 )
                 card_number = int(card.get("card_number", generated_count + 1))
                 output_path = self.output_dir / f"card_{card_number:02d}.png"
@@ -1668,7 +2460,9 @@ class BingoDesktopApp(ctk.CTk):
             )
         except Exception as error:
             self.generate_status_label.configure(text="Generation status: failed")
-            messagebox.showerror("Generation Error", f"Could not generate cards:\n{error}")
+            messagebox.showerror(
+                "Generation Error", f"Could not generate cards:\n{error}"
+            )
         finally:
             self.generate_button.configure(state="normal")
 
@@ -1688,7 +2482,9 @@ class BingoDesktopApp(ctk.CTk):
             width=max(180, canvas_w - 40),
         )
         self.preview_canvas.configure(scrollregion=(0, 0, canvas_w, canvas_h))
-        self._set_preview_scrollbars_visibility(show_horizontal=False, show_vertical=False)
+        self._set_preview_scrollbars_visibility(
+            show_horizontal=False, show_vertical=False
+        )
 
     def _set_preview_scrollbars_visibility(
         self, show_horizontal: bool, show_vertical: bool
@@ -1855,6 +2651,105 @@ class BingoDesktopApp(ctk.CTk):
             show_vertical=render_h > layout["canvas_h"],
         )
 
+    def _invalidate_preview_caches(self) -> None:
+        self._cached_preview_matrix = None
+        self._cached_preview_matrix_key = None
+    def _invalidate_free_image_cache(self) -> None:
+        self._cached_free_image = None
+        self._cached_free_image_path = None
+
+    def _preview_matrix_cache_key(self, grid_size: int) -> tuple:
+        return (
+            str(self.pdf_path) if self.pdf_path else None,
+            grid_size,
+            tuple(sorted(self.music_name_overrides.items())),
+            tuple(
+                (track.get("id"), track.get("name"), track.get("artist"))
+                for track in self.playlist_tracks
+            ),
+            bool(self.playlist_include_artist),
+        )
+
+    def _get_preview_matrix(self, grid_size: int) -> list[list[str]]:
+        cache_key = self._preview_matrix_cache_key(grid_size)
+        if (
+            self._cached_preview_matrix is not None
+            and self._cached_preview_matrix_key == cache_key
+        ):
+            return self._cached_preview_matrix
+
+        matrix = get_placeholder_matrix(grid_size)
+        if self.pdf_path:
+            try:
+                extracted = extract_first_card_matrix(self.pdf_path, grid_size)
+                if extracted and len(extracted) == grid_size:
+                    normalized = [
+                        [self._canonical_cell_text(cell) for cell in row]
+                        for row in extracted
+                    ]
+                    matrix = self._apply_music_name_overrides(normalized)
+            except Exception:
+                pass
+
+        self._cached_preview_matrix = matrix
+        self._cached_preview_matrix_key = cache_key
+        return matrix
+
+    def _get_free_image_rgba(self) -> Image.Image | None:
+        icon_path = self.free_icon_path or FREE_IMAGE_PATH
+        if (
+            self._cached_free_image is not None
+            and self._cached_free_image_path == icon_path
+        ):
+            return self._cached_free_image
+
+        if not icon_path.exists():
+            self._cached_free_image = None
+            self._cached_free_image_path = icon_path
+            return None
+
+        self._cached_free_image = Image.open(icon_path).convert("RGBA")
+        self._cached_free_image_path = icon_path
+        return self._cached_free_image
+
+    def _schedule_preview_refresh(self) -> None:
+        if self._loading_state:
+            return
+        if self._preview_refresh_after_id is not None:
+            self.after_cancel(self._preview_refresh_after_id)
+        self._preview_refresh_after_id = self.after(
+            PREVIEW_REFRESH_DEBOUNCE_MS, self._run_scheduled_preview_refresh
+        )
+
+    def _run_scheduled_preview_refresh(self) -> None:
+        self._preview_refresh_after_id = None
+        self._refresh_preview()
+
+    def _flush_preview_refresh(self) -> None:
+        if self._preview_refresh_after_id is not None:
+            self.after_cancel(self._preview_refresh_after_id)
+            self._preview_refresh_after_id = None
+        self._refresh_preview()
+
+    def _schedule_save_state(self) -> None:
+        if self._loading_state:
+            return
+        if self._save_state_after_id is not None:
+            self.after_cancel(self._save_state_after_id)
+        self._save_state_after_id = self.after(
+            SAVE_STATE_DEBOUNCE_MS, self._run_scheduled_save_state
+        )
+
+    def _run_scheduled_save_state(self) -> None:
+        self._save_state_after_id = None
+        self._save_state()
+
+    def _flush_save_state(self) -> None:
+        if self._save_state_after_id is not None:
+            self.after_cancel(self._save_state_after_id)
+            self._save_state_after_id = None
+        self._save_state()
+
     def _pick_text_color(self):
         initial_color = self._normalize_color(self.text_color_var.get())
         selected, hex_color = colorchooser.askcolor(
@@ -1862,8 +2757,12 @@ class BingoDesktopApp(ctk.CTk):
         )
         if selected is None or not hex_color:
             return
-        self.text_color_var.set(hex_color.lower())
-        self._refresh_preview()
+        normalized = hex_color.lower()
+        if normalized == initial_color:
+            return
+        self._stash_customize_undo("color_picker")
+        self.text_color_var.set(normalized)
+        self._schedule_preview_refresh()
 
     def _normalize_color(self, value: str) -> str:
         if not value:
@@ -1880,48 +2779,11 @@ class BingoDesktopApp(ctk.CTk):
         return color.lower()
 
     def _refresh_preview(self):
-        self.font_size_value_label.configure(text=str(int(self.font_size_var.get())))
-        self.text_offset_x_value_label.configure(text=str(int(self.text_offset_x_var.get())))
-        self.text_offset_y_value_label.configure(text=str(int(self.text_offset_y_var.get())))
-        self.free_icon_size_value_label.configure(
-            text=f"{float(self.free_icon_size_var.get()):.2f}"
-        )
-        self.grid_offset_x_value_label.configure(text=str(int(self.grid_offset_x_var.get())))
-        self.grid_offset_y_value_label.configure(text=str(int(self.grid_offset_y_var.get())))
-        self.manual_cell_width_value_label.configure(
-            text=str(int(self.manual_cell_width_var.get()))
-        )
-        self.manual_cell_height_value_label.configure(
-            text=str(int(self.manual_cell_height_var.get()))
-        )
-
         if self.template_image is None:
-            return
-        if (
-            self.template_layout
-            and self.pdf_layout
-            and self.template_layout != self.pdf_layout
-        ):
-            self._show_preview_warning(
-                (
-                    f"Layout mismatch detected.\n"
-                    f"Template: {self.template_layout}x{self.template_layout}\n"
-                    f"PDF: {self.pdf_layout}x{self.pdf_layout}\n\n"
-                    f"Please use matching layouts to preview."
-                )
-            )
             return
 
         grid_size = self._effective_grid_size()
-        matrix = get_placeholder_matrix(grid_size)
-
-        if self.pdf_path:
-            try:
-                extracted = extract_first_card_matrix(self.pdf_path, grid_size)
-                if extracted and len(extracted) == grid_size:
-                    matrix = self._apply_music_name_overrides(extracted)
-            except Exception:
-                pass
+        matrix = self._get_preview_matrix(grid_size)
 
         color_value = self._normalize_color(self.text_color_var.get())
         if color_value != self.text_color_var.get().strip().lower():
@@ -1939,12 +2801,12 @@ class BingoDesktopApp(ctk.CTk):
             text_offset_x=int(self.text_offset_x_var.get()),
             text_offset_y=int(self.text_offset_y_var.get()),
             free_icon_size=float(self.free_icon_size_var.get()),
-            grid_offset_x=int(self.grid_offset_x_var.get()),
-            grid_offset_y=int(self.grid_offset_y_var.get()),
-            manual_cell_width=int(self.manual_cell_width_var.get()),
-            manual_cell_height=int(self.manual_cell_height_var.get()),
+            grid_x=int(self.grid_x_var.get()),
+            grid_y=int(self.grid_y_var.get()),
+            cell_width=int(self.grid_cell_width_var.get()),
+            cell_height=int(self.grid_cell_height_var.get()),
             show_grid_overlay=bool(self.show_grid_overlay_var.get()),
-            free_image_path=self.free_icon_path,
+            free_image=self._get_free_image_rgba(),
         )
 
         should_fit_preview = (
@@ -1957,49 +2819,96 @@ class BingoDesktopApp(ctk.CTk):
             self._render_preview_image()
         else:
             self._render_preview_image()
-        self._save_state()
+        self._schedule_save_state()
 
     def _load_template_file(self, path: Path, show_error: bool):
         self.template_path = path
         try:
             self.template_image = Image.open(self.template_path).convert("RGB")
-            self.template_layout = detect_template_layout(self.template_image)
-            self.template_layout_label.configure(
-                text=f"Template layout: {self.template_layout}x{self.template_layout}"
-            )
-            self._refresh_preview()
+            self._invalidate_preview_caches()
+            if show_error:
+                self._reset_grid_placement()
+            elif (
+                self._pending_legacy_grid_offsets is not None
+                or self._pending_legacy_cell_adjustments is not None
+            ):
+                if self._pending_legacy_grid_offsets is not None:
+                    offset_x, offset_y = self._pending_legacy_grid_offsets
+                    self._apply_legacy_grid_offsets(offset_x, offset_y)
+                    self._pending_legacy_grid_offsets = None
+                if self._pending_legacy_cell_adjustments is not None:
+                    width_adj, height_adj = self._pending_legacy_cell_adjustments
+                    self._apply_legacy_cell_adjustments(width_adj, height_adj)
+                    self._pending_legacy_cell_adjustments = None
+            self._flush_preview_refresh()
             return True
         except Exception as error:
             self.template_path = None
             self.template_image = None
-            self.template_layout = None
-            self.template_layout_label.configure(text="Template layout: -")
             if show_error:
-                messagebox.showerror("Template Error", f"Could not read template:\n{error}")
+                messagebox.showerror(
+                    "Template Error", f"Could not read template:\n{error}"
+                )
             return False
 
-    def _load_pdf_file(self, path: Path, show_error: bool):
+    def _load_pdf_file(
+        self, path: Path, show_error: bool, reset_grid: bool = False
+    ):
+        previous_layout = self.pdf_layout
         self.pdf_path = path
         self.cached_pdf_cards = None
-        self.music_name_overrides = {}
+        if not self._loading_state:
+            self.music_name_overrides = {}
         try:
             self.pdf_layout = detect_pdf_layout(self.pdf_path)
-            self.pdf_layout_label.configure(
-                text=f"PDF layout: {self.pdf_layout}x{self.pdf_layout}"
-            )
+            self._update_pdf_layout_label()
+            if reset_grid or (
+                previous_layout is not None and previous_layout != self.pdf_layout
+            ):
+                self._reset_grid_placement()
             self.edit_music_button.configure(state="normal")
-            self._refresh_preview()
+            self._invalidate_preview_caches()
+            self._refresh_music_name_override_aliases()
+            self._flush_preview_refresh()
             return True
         except Exception as error:
             self.pdf_path = None
             self.pdf_layout = None
             self.cached_pdf_cards = None
-            self.music_name_overrides = {}
-            self.pdf_layout_label.configure(text="PDF layout: -")
+            if not self._loading_state:
+                self.music_name_overrides = {}
+            self._update_pdf_layout_label()
             self.edit_music_button.configure(state="disabled")
             if show_error:
                 messagebox.showerror("PDF Error", f"Could not read PDF:\n{error}")
             return False
+
+    def _playlist_track_label_list(self) -> list[str]:
+        if not self.playlist_tracks:
+            return []
+        return playlist_track_labels(
+            self.playlist_tracks, self.playlist_include_artist
+        )
+
+    def _canonical_cell_text(self, cell: str) -> str:
+        if is_free_cell_text(cell):
+            return cell
+        labels = self._playlist_track_label_list()
+        if labels:
+            matched = match_cell_to_playlist_label(cell, labels)
+            if matched:
+                return matched
+        return canonical_music_name(cell)
+
+    def _music_track_key(self, text: str) -> str:
+        if is_free_cell_text(text):
+            return ""
+        labels = self._playlist_track_label_list()
+        if labels:
+            matched = match_cell_to_playlist_label(text, labels)
+            if matched:
+                return matched.casefold()
+        return song_identity_key(text)
 
     def _get_cached_valid_cards(self, force_reload: bool = False) -> list[dict]:
         if self.pdf_path is None:
@@ -2013,8 +2922,7 @@ class BingoDesktopApp(ctk.CTk):
             if not matrix:
                 continue
             normalized_matrix = [
-                [normalize_song_name(cell) for cell in row]
-                for row in matrix
+                [self._canonical_cell_text(cell) for cell in row] for row in matrix
             ]
             normalized_card = dict(card)
             normalized_card["songs_matrix"] = normalized_matrix
@@ -2022,54 +2930,172 @@ class BingoDesktopApp(ctk.CTk):
         self.cached_pdf_cards = valid_cards
         return self.cached_pdf_cards
 
+    def _identity_override_map(self, user_overrides: dict[str, str]) -> dict[str, str]:
+        identity_map: dict[str, str] = {}
+        for original, updated in user_overrides.items():
+            identity = self._music_track_key(original)
+            if identity:
+                identity_map[identity] = updated
+        return identity_map
+
+    def _expand_music_name_overrides(self, user_overrides: dict[str, str]) -> dict[str, str]:
+        """Map every cell variant on any card that shares the same song title."""
+        if not user_overrides:
+            return {}
+
+        identity_targets = self._identity_override_map(user_overrides)
+        expanded = dict(user_overrides)
+
+        for card in self._get_cached_valid_cards():
+            for row in card.get("songs_matrix") or []:
+                for cell in row:
+                    if is_free_cell_text(cell):
+                        continue
+                    identity = self._music_track_key(cell)
+                    if identity in identity_targets:
+                        expanded[cell] = identity_targets[identity]
+
+        return expanded
+
+    def _refresh_music_name_override_aliases(self) -> None:
+        if not self.music_name_overrides or self.pdf_path is None:
+            return
+
+        identity_updates = self._identity_override_map(self.music_name_overrides)
+        if not identity_updates:
+            return
+
+        representative: dict[str, str] = {}
+        seen_identities: set[str] = set()
+        for card in self._get_cached_valid_cards():
+            for row in card.get("songs_matrix") or []:
+                for cell in row:
+                    if is_free_cell_text(cell):
+                        continue
+                    identity = self._music_track_key(cell)
+                    if (
+                        identity in identity_updates
+                        and identity not in seen_identities
+                    ):
+                        representative[cell] = identity_updates[identity]
+                        seen_identities.add(identity)
+
+        self.music_name_overrides = self._expand_music_name_overrides(representative)
+
+    def _music_override_value_for(self, display_name: str) -> str:
+        identity = self._music_track_key(display_name)
+        identity_map = self._identity_override_map(self.music_name_overrides)
+        if identity in identity_map:
+            return identity_map[identity]
+        if display_name in self.music_name_overrides:
+            return self.music_name_overrides[display_name]
+        return self.music_name_overrides.get(
+            canonical_music_name(display_name), display_name
+        )
+
+    def _resolve_music_cell_text(self, cell: str) -> str:
+        if is_free_cell_text(cell):
+            return cell
+        identity_map = self._identity_override_map(self.music_name_overrides)
+        identity = self._music_track_key(cell)
+        if identity in identity_map:
+            return identity_map[identity]
+        return self.music_name_overrides.get(
+            cell,
+            self.music_name_overrides.get(canonical_music_name(cell), cell),
+        )
+
     def _apply_music_name_overrides(self, matrix: list[list[str]]) -> list[list[str]]:
         if not self.music_name_overrides:
             return matrix
         return [
-            [self.music_name_overrides.get(cell, cell) for cell in row]
-            for row in matrix
+            [self._resolve_music_cell_text(cell) for cell in row] for row in matrix
         ]
 
     def _collect_music_names(self, cards: list[dict]) -> list[str]:
-        unique_names: dict[str, None] = {}
+        identity_to_display: dict[str, str] = {}
         for card in cards:
             matrix = card.get("songs_matrix") or []
             for row in matrix:
                 for song_name in row:
-                    cleaned = (song_name or "").strip()
-                    if cleaned and not is_free_cell_text(cleaned):
-                        unique_names.setdefault(cleaned, None)
-        return sorted(unique_names.keys(), key=str.casefold)
+                    if is_free_cell_text(song_name):
+                        continue
+                    identity = self._music_track_key(song_name)
+                    if identity and identity not in identity_to_display:
+                        identity_to_display[identity] = song_name.strip()
+        return sorted(identity_to_display.values(), key=str.casefold)
 
-    def _open_music_name_editor(self):
-        if self.pdf_path is None:
-            messagebox.showwarning("Missing PDF", "Please import the cards PDF first.")
-            return
-        try:
-            cards = self._get_cached_valid_cards()
-        except Exception as error:
-            messagebox.showerror("PDF Error", f"Could not parse songs from PDF:\n{error}")
-            return
-        if not cards:
-            messagebox.showwarning("No Songs Found", "No songs were extracted from the PDF.")
+    def _open_music_name_editor(self, tutorial_mode: bool = False):
+        if (
+            tutorial_mode
+            and self._tutorial_music_editor_dialog
+            and self._tutorial_music_editor_dialog.winfo_exists()
+        ):
+            self._tutorial_music_editor_dialog.lift()
+            self._tutorial_music_editor_dialog.focus_force()
             return
 
-        names = self._collect_music_names(cards)
-        if not names:
-            messagebox.showwarning("No Songs Found", "No songs were extracted from the PDF.")
-            return
+        names: list[str]
+        if tutorial_mode:
+            names = self._tutorial_music_editor_sample_names()
+            if self.pdf_path is not None:
+                try:
+                    cards = self._get_cached_valid_cards()
+                    collected = self._collect_music_names(cards)
+                    if collected:
+                        names = collected
+                except Exception:
+                    pass
+        else:
+            if self.pdf_path is None:
+                messagebox.showwarning(
+                    "Missing PDF",
+                    "Please import from Spotify playlist first.",
+                )
+                return
+            try:
+                cards = self._get_cached_valid_cards()
+            except Exception as error:
+                messagebox.showerror(
+                    "PDF Error", f"Could not parse songs from PDF:\n{error}"
+                )
+                return
+            if not cards:
+                messagebox.showwarning(
+                    "No Songs Found", "No songs were extracted from the PDF."
+                )
+                return
+
+            names = self._collect_music_names(cards)
+            if not names:
+                messagebox.showwarning(
+                    "No Songs Found", "No songs were extracted from the PDF."
+                )
+                return
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Edit Music Names")
         dialog.geometry("920x700")
         dialog.transient(self)
-        dialog.grab_set()
+        if not tutorial_mode:
+            dialog.grab_set()
         dialog.grid_columnconfigure(0, weight=1)
         dialog.grid_rowconfigure(1, weight=1)
+        if tutorial_mode:
+            self._tutorial_music_editor_dialog = dialog
 
+            def _clear_tutorial_music_dialog_ref(_event=None):
+                if self._tutorial_music_editor_dialog is dialog:
+                    self._tutorial_music_editor_dialog = None
+
+            dialog.bind("<Destroy>", _clear_tutorial_music_dialog_ref, add="+")
+
+        header_text = "Update song names before generating cards"
+        if tutorial_mode and self.pdf_path is None:
+            header_text = "Tutorial preview — import a playlist to edit real song names"
         ctk.CTkLabel(
             dialog,
-            text="Update song names before generating cards",
+            text=header_text,
             font=ctk.CTkFont(size=18, weight="bold"),
         ).grid(row=0, column=0, padx=16, pady=(16, 8), sticky="w")
 
@@ -2086,7 +3112,7 @@ class BingoDesktopApp(ctk.CTk):
                 anchor="w",
                 wraplength=360,
             ).grid(row=index, column=0, padx=(8, 8), pady=4, sticky="ew")
-            current_value = self.music_name_overrides.get(original_name, original_name)
+            current_value = self._music_override_value_for(original_name)
             value_var = tk.StringVar(value=current_value)
             entry_vars[original_name] = value_var
             ctk.CTkEntry(scroll, textvariable=value_var).grid(
@@ -2111,13 +3137,18 @@ class BingoDesktopApp(ctk.CTk):
                     updated_name = original_name
                 if updated_name != original_name:
                     updated_overrides[original_name] = updated_name
-            self.music_name_overrides = updated_overrides
+            if not tutorial_mode:
+                self.music_name_overrides = self._expand_music_name_overrides(
+                    updated_overrides
+                )
+                self._invalidate_preview_caches()
             dialog.destroy()
-            self._refresh_preview()
-            messagebox.showinfo(
-                "Music Names Updated",
-                f"Saved {len(updated_overrides)} replacement(s).",
-            )
+            if not tutorial_mode:
+                self._schedule_preview_refresh()
+                messagebox.showinfo(
+                    "Music Names Updated",
+                    f"Saved {len(updated_overrides)} replacement(s).",
+                )
 
         ctk.CTkButton(
             actions,
@@ -2155,12 +3186,27 @@ class BingoDesktopApp(ctk.CTk):
             "text_offset_y": int(self.text_offset_y_var.get()),
             "free_icon_size": float(self.free_icon_size_var.get()),
             "free_icon_path": str(self.free_icon_path) if self.free_icon_path else None,
-            "grid_offset_x": int(self.grid_offset_x_var.get()),
-            "grid_offset_y": int(self.grid_offset_y_var.get()),
-            "manual_cell_width": int(self.manual_cell_width_var.get()),
-            "manual_cell_height": int(self.manual_cell_height_var.get()),
+            "pdf_layout": self.pdf_layout,
+            "grid_x": int(self.grid_x_var.get()),
+            "grid_y": int(self.grid_y_var.get()),
+            "grid_cell_width": int(self.grid_cell_width_var.get()),
+            "grid_cell_height": int(self.grid_cell_height_var.get()),
             "show_grid_overlay": bool(self.show_grid_overlay_var.get()),
             "music_name_overrides": dict(self.music_name_overrides),
+            "playlist_tracks": [
+                {
+                    "id": track.get("id"),
+                    "name": track.get("name"),
+                    "artist": track.get("artist"),
+                }
+                for track in self.playlist_tracks
+            ],
+            "playlist_include_artist": bool(self.playlist_include_artist),
+            "spotify_playlist_url": self.spotify_playlist_url_var.get().strip(),
+            "spotify_grid_size": self.spotify_grid_size_var.get(),
+            "spotify_card_count": int(self.spotify_card_count_var.get()),
+            "spotify_include_artist": bool(self.spotify_include_artist_var.get()),
+            "spotify_free_center": bool(self.spotify_free_center_var.get()),
             "text_settings_expanded": bool(self.text_settings_expanded),
             "grid_settings_expanded": bool(self.grid_settings_expanded),
             "tutorial_seen": bool(self.tutorial_seen),
@@ -2189,21 +3235,54 @@ class BingoDesktopApp(ctk.CTk):
         try:
             self.text_color_var.set(state.get("text_color", "#000000"))
             self.font_size_var.set(int(state.get("font_size", 26)))
-            text_offset_y = int(state.get("text_offset_y", state.get("text_y_padding", 0)))
+            text_offset_y = int(
+                state.get("text_offset_y", state.get("text_y_padding", 0))
+            )
             self.text_offset_x_var.set(int(state.get("text_offset_x", 0)))
             self.text_offset_y_var.set(text_offset_y)
-            self.free_icon_size_var.set(float(state.get("free_icon_size", FREE_ICON_SIZE_DEFAULT)))
+            self.free_icon_size_var.set(
+                float(state.get("free_icon_size", FREE_ICON_SIZE_DEFAULT))
+            )
             free_icon_path = state.get("free_icon_path")
             if free_icon_path and Path(free_icon_path).exists():
                 self.free_icon_path = Path(free_icon_path)
             else:
                 self.free_icon_path = None
             self.free_icon_path_label.configure(text=self._format_free_icon_label())
-            self.grid_offset_x_var.set(int(state.get("grid_offset_x", 0)))
-            self.grid_offset_y_var.set(int(state.get("grid_offset_y", 0)))
-            self.manual_cell_width_var.set(int(state.get("manual_cell_width", 0)))
-            self.manual_cell_height_var.set(int(state.get("manual_cell_height", 0)))
+            saved_pdf_layout = state.get("pdf_layout")
+            if saved_pdf_layout in SUPPORTED_GRID_SIZES:
+                self.pdf_layout = int(saved_pdf_layout)
+                self._update_pdf_layout_label()
+            self._pending_legacy_grid_offsets = None
+            if "grid_x" in state or "grid_y" in state:
+                self.grid_x_var.set(int(state.get("grid_x", 0)))
+                self.grid_y_var.set(int(state.get("grid_y", 0)))
+            else:
+                self._pending_legacy_grid_offsets = (
+                    int(state.get("grid_offset_x", 0)),
+                    int(state.get("grid_offset_y", 0)),
+                )
+            self._pending_legacy_cell_adjustments = None
+            if "grid_cell_width" in state or "grid_cell_height" in state:
+                self.grid_cell_width_var.set(int(state.get("grid_cell_width", 120)))
+                self.grid_cell_height_var.set(int(state.get("grid_cell_height", 120)))
+            else:
+                self._pending_legacy_cell_adjustments = (
+                    int(state.get("manual_cell_width", 0)),
+                    int(state.get("manual_cell_height", 0)),
+                )
             self.show_grid_overlay_var.set(bool(state.get("show_grid_overlay", True)))
+            self.spotify_playlist_url_var.set(
+                str(state.get("spotify_playlist_url", "")).strip()
+            )
+            self.spotify_grid_size_var.set(str(state.get("spotify_grid_size", "5x5")))
+            self.spotify_card_count_var.set(int(state.get("spotify_card_count", 20)))
+            self.spotify_include_artist_var.set(
+                bool(state.get("spotify_include_artist", False))
+            )
+            self.spotify_free_center_var.set(
+                bool(state.get("spotify_free_center", True))
+            )
             saved_overrides = state.get("music_name_overrides", {})
             if isinstance(saved_overrides, dict):
                 self.music_name_overrides = {
@@ -2213,6 +3292,23 @@ class BingoDesktopApp(ctk.CTk):
                 }
             else:
                 self.music_name_overrides = {}
+
+            saved_tracks = state.get("playlist_tracks", [])
+            if isinstance(saved_tracks, list):
+                self.playlist_tracks = [
+                    {
+                        "id": entry.get("id"),
+                        "name": str(entry.get("name", "")),
+                        "artist": str(entry.get("artist", "")),
+                    }
+                    for entry in saved_tracks
+                    if isinstance(entry, dict) and str(entry.get("name", "")).strip()
+                ]
+            else:
+                self.playlist_tracks = []
+            self.playlist_include_artist = bool(
+                state.get("playlist_include_artist", False)
+            )
 
             output_dir = state.get("output_dir")
             if output_dir:
@@ -2243,13 +3339,19 @@ class BingoDesktopApp(ctk.CTk):
                         for original, updated in saved_overrides.items()
                         if str(original).strip() and str(updated).strip()
                     }
+                self._refresh_music_name_override_aliases()
         finally:
             self._loading_state = False
 
-        self._refresh_preview()
+        self._customize_undo_stack.clear()
+        self._customize_redo_stack.clear()
+        self._clear_customize_action_group()
+        self._update_customize_undo_redo_buttons()
+        self._flush_preview_refresh()
 
     def _on_close(self):
-        self._save_state()
+        self._flush_preview_refresh()
+        self._flush_save_state()
         self.destroy()
 
 
