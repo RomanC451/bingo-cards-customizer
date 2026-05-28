@@ -14,7 +14,7 @@ except ModuleNotFoundError as error:
     hint = (
         f"Missing dependency: {error.name}\n\n"
         "Install dependencies, then run again:\n"
-        f"  {venv_python} -m pip install -r requirement.txt\n"
+        f"  {venv_python} -m pip install -r requirements.txt\n"
         f"  {venv_python} ui_desktop.py"
     )
     if sys.stdin.isatty():
